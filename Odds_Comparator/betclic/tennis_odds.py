@@ -1,8 +1,8 @@
 """
 Scrape tennis odds from Betclic France via gRPC-web.
 
-Note: Betclic does NOT offer aces or breaks markets for tennis.
-Markets available: match winner, set results, total games, handicap, points.
+Markets: match winner, sets, total games, handicap, aces (ca_ten_ptss).
+Breaks and aces appear in ca_ten_ptss closer to match time — use --all-categories to retrieve them.
 
 Usage:
     python tennis_odds.py                            # all matches, Le Top category (~7 markets)

@@ -207,7 +207,7 @@ def parse_betclic(data: list[dict]) -> dict:
                     result[mk][('match_winner', None)][side].append(
                         Offer('betclic', o['odds'], o['name']))
 
-            # ── Total jeux (toutes les lignes dans un seul marché) ──
+            # ── Total jeux ──
             elif norm_name == 'nombre total de jeux':
                 for o in outcomes:
                     line = extract_line(o['name'])
@@ -215,6 +215,38 @@ def parse_betclic(data: list[dict]) -> dict:
                     if line and over is not None:
                         side = 'over' if over else 'under'
                         result[mk][('total_games', line)][side].append(
+                            Offer('betclic', o['odds'], o['name']))
+
+            # ── Aces par joueur : "Prénom Nom - Nombre total d'aces" ──
+            elif "nombre total d'aces" in norm_name and ' - ' in name and 'vainqueur' not in norm_name:
+                player_part = name.split(' - ')[0].strip()
+                player_ln = last_name(player_part)
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        side = 'over' if over else 'under'
+                        result[mk][('player_aces', line, player_ln)][side].append(
+                            Offer('betclic', o['odds'], o['name']))
+
+            # ── Total aces match : "Nombre total d'aces dans le match" ──
+            elif "nombre total d'aces" in norm_name and 'vainqueur' not in norm_name:
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        side = 'over' if over else 'under'
+                        result[mk][('total_aces', line)][side].append(
+                            Offer('betclic', o['odds'], o['name']))
+
+            # ── Total breaks ──
+            elif 'nombre total de breaks' in norm_name or 'nombre de breaks' in norm_name:
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        side = 'over' if over else 'under'
+                        result[mk][('total_breaks', line)][side].append(
                             Offer('betclic', o['odds'], o['name']))
 
     return result
@@ -486,7 +518,9 @@ def fetch_all_odds(prematch_only: bool = True) -> tuple[list, list, list]:
         try:
             mod = _load_scraper('betclic')
             with mod.BetclicClient() as c:
-                matches = mod.scrape_all_tennis(c, prematch_only=prematch_only)
+                matches = mod.scrape_all_tennis(
+                    c, prematch_only=prematch_only, all_categories=True
+                )
             results['betclic'] = [dataclasses.asdict(m) for m in matches]
             print(f'  betclic : {len(matches)} matchs', flush=True)
         except Exception as e:

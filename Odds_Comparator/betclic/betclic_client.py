@@ -1,12 +1,12 @@
 """
 Betclic France odds scraper using gRPC-web (offering.begmedia.com).
-Betclic does NOT offer aces/breaks markets for tennis.
+Betclic France tennis odds scraper using gRPC-web.
 Available categories (use category_id in get_match_markets):
   'ca_ten_top'  → Le Top           (featured, ~7 markets, default)
   'ca_ten_rslt' → Résultats        (~9 markets)
   'ca_ten_sts'  → Sets             (~12 markets)
   'ca_ten_gms'  → Jeux             (~12 markets, includes game handicap)
-  'ca_ten_ptss' → Points & Service (~5 markets)
+  'ca_ten_ptss' → Points & Service (aces totals + aces par joueur; breaks appear closer to match time)
 """
 
 import struct
