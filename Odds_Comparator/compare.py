@@ -9,27 +9,29 @@ Principe :
   4. Affiche les cotes supérieures à la cote juste (= value bets)
 
 Usage :
-    # Depuis des fichiers JSON existants
-    python compare.py --winamax w.json --betclic b.json --unibet u.json
-
-    # Lance les 3 scrapers en parallèle automatiquement
+    # Récupération unique (tous les bookmakers en parallèle, sans stockage fichier)
     python compare.py --fetch
+
+    # Mode temps réel : rafraîchit toutes les 60s (Ctrl+C pour quitter)
+    python compare.py --watch
+
+    # Mode temps réel avec intervalle personnalisé (ex: 120s)
+    python compare.py --watch 120
 
     # Seuil minimum d'edge (défaut 3%)
     python compare.py --fetch --min-edge 5.0
 
-    # Exporter les value bets en JSON
-    python compare.py --fetch --output value_bets.json
-
     # Consensus basé sur au moins 3 bookmakers
-    python compare.py --fetch --min-books 3
+    python compare.py --watch --min-books 3
+
+    # Depuis des fichiers JSON existants
+    python compare.py --winamax w.json --betclic b.json --unibet u.json
 """
 import re
 import sys
 import json
 import argparse
 import unicodedata
-import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -440,30 +442,77 @@ def compute_value_bets(
     return sorted(value_bets, key=lambda v: -v.edge_pct)
 
 
-# ── Lancement des scrapers ────────────────────────────────────────────────────
+
+# ── Chargement dynamique des scrapers ─────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).parent
-_SCRAPER_TIMEOUT = 180  # seconds per scraper
 
 
-def run_scraper(subdir: str, output_path: str) -> bool:
-    """Run a scraper subprocess; returns True on success."""
-    script = _SCRIPT_DIR / subdir / 'tennis_odds.py'
-    cmd = [sys.executable, str(script), '--output', output_path, '--prematch-only']
-    print(f'  Lancement {subdir}…', flush=True)
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            cwd=str(_SCRIPT_DIR / subdir),
-            timeout=_SCRAPER_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        print(f'  TIMEOUT {subdir} (>{_SCRAPER_TIMEOUT}s)', file=sys.stderr)
-        return False
-    if result.returncode != 0:
-        print(f'  ERREUR {subdir}: {result.stderr[:300]}', file=sys.stderr)
-        return False
-    return True
+def _load_scraper(subdir: str):
+    """Importe tennis_odds depuis le sous-dossier sans passer par subprocess."""
+    import importlib.util as _ilu
+    subdir_path = _SCRIPT_DIR / subdir
+    path_str = str(subdir_path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+    spec = _ilu.spec_from_file_location(f'_{subdir}_odds', subdir_path / 'tennis_odds.py')
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def fetch_all_odds(prematch_only: bool = True) -> tuple[list, list, list]:
+    """Fetch odds from all 3 bookmakers in parallel threads.
+
+    Returns (winamax_raw, betclic_raw, unibet_raw) as lists of dicts
+    ready to be passed to parse_winamax / parse_betclic / parse_unibet.
+    """
+    import dataclasses
+    import threading as _th
+
+    results: dict[str, list] = {'winamax': [], 'betclic': [], 'unibet': []}
+
+    def _run_winamax():
+        try:
+            mod = _load_scraper('winamax')
+            with mod.WinamaxClient() as c:
+                matches = mod.scrape_all_tennis_odds(c, prematch_only=prematch_only)
+            results['winamax'] = [dataclasses.asdict(m) for m in matches]
+            print(f'  winamax : {len(matches)} matchs', flush=True)
+        except Exception as e:
+            print(f'  winamax : ERREUR — {e}', file=sys.stderr, flush=True)
+
+    def _run_betclic():
+        try:
+            mod = _load_scraper('betclic')
+            with mod.BetclicClient() as c:
+                matches = mod.scrape_all_tennis(c, prematch_only=prematch_only)
+            results['betclic'] = [dataclasses.asdict(m) for m in matches]
+            print(f'  betclic : {len(matches)} matchs', flush=True)
+        except Exception as e:
+            print(f'  betclic : ERREUR — {e}', file=sys.stderr, flush=True)
+
+    def _run_unibet():
+        try:
+            mod = _load_scraper('unibet')
+            with mod.UnibetClient() as c:
+                matches = mod.scrape_tennis_odds(c, prematch_only=prematch_only)
+            results['unibet'] = [dataclasses.asdict(m) for m in matches]
+            print(f'  unibet  : {len(matches)} matchs', flush=True)
+        except Exception as e:
+            print(f'  unibet  : ERREUR — {e}', file=sys.stderr, flush=True)
+
+    threads = [
+        _th.Thread(target=_run_winamax, daemon=True),
+        _th.Thread(target=_run_betclic, daemon=True),
+        _th.Thread(target=_run_unibet,  daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return results['winamax'], results['betclic'], results['unibet']
 
 
 # ── Affichage ────────────────────────────────────────────────────────────────
@@ -493,11 +542,13 @@ def print_results(value_bets: list[ValueBet], min_edge: float):
 
 def main():
     parser = argparse.ArgumentParser(description='Comparateur de cotes tennis')
-    parser.add_argument('--winamax', help='JSON Winamax')
-    parser.add_argument('--betclic', help='JSON Betclic')
-    parser.add_argument('--unibet',  help='JSON Unibet')
+    parser.add_argument('--winamax', help='JSON Winamax (lecture depuis fichier)')
+    parser.add_argument('--betclic', help='JSON Betclic (lecture depuis fichier)')
+    parser.add_argument('--unibet',  help='JSON Unibet  (lecture depuis fichier)')
     parser.add_argument('--fetch',   action='store_true',
-                        help='Lance les 3 scrapers automatiquement')
+                        help='Récupère les cotes une fois (tous les bookmakers en parallèle)')
+    parser.add_argument('--watch',   type=int, metavar='SECONDES', nargs='?', const=60,
+                        help='Mode temps réel : rafraîchit toutes les N secondes (défaut: 60)')
     parser.add_argument('--min-edge', type=float, default=3.0,
                         help='Edge minimum en %% (défaut: 3.0)')
     parser.add_argument('--min-books', type=int, default=2,
@@ -505,47 +556,49 @@ def main():
     parser.add_argument('--output', help='Exporter les value bets en JSON')
     args = parser.parse_args()
 
-    import tempfile, os
+    live_mode = args.watch is not None
+    do_fetch  = args.fetch or live_mode
+    interval  = args.watch or 0  # 0 = run once
 
-    tmp_files = {}
+    if do_fetch:
+        import time as _time
+        first_run = True
+        try:
+            while True:
+                if live_mode and not first_run:
+                    print('\033[2J\033[H', end='')  # clear screen
+                first_run = False
 
-    if args.fetch:
-        print('Récupération des cotes en cours (scrapers lancés en parallèle)…')
-        import threading as _threading
-        with tempfile.TemporaryDirectory() as tmpdir:
-            paths = {
-                'winamax': os.path.join(tmpdir, 'winamax.json'),
-                'betclic': os.path.join(tmpdir, 'betclic.json'),
-                'unibet':  os.path.join(tmpdir, 'unibet.json'),
-            }
-            threads = [
-                _threading.Thread(target=run_scraper, args=(bk, path), daemon=True)
-                for bk, path in paths.items()
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=_SCRAPER_TIMEOUT + 5)
+                ts = _time.strftime('%H:%M:%S')
+                print(f'[{ts}] Récupération des cotes en parallèle…', flush=True)
 
-            data = {}
-            for bk, path in paths.items():
-                try:
-                    with open(path) as f:
-                        data[bk] = json.load(f)
-                    print(f'  {bk}: {len(data[bk])} matchs chargés')
-                except FileNotFoundError:
-                    print(f'  {bk}: fichier manquant, ignoré')
-                    data[bk] = []
+                wm_raw, bc_raw, ub_raw = fetch_all_odds(prematch_only=True)
 
-            wm = parse_winamax(data.get('winamax', []))
-            bc = parse_betclic(data.get('betclic', []))
-            ub = parse_unibet(data.get('unibet', []))
+                wm = parse_winamax(wm_raw)
+                bc = parse_betclic(bc_raw)
+                ub = parse_unibet(ub_raw)
 
-            value_bets = compute_value_bets([wm, bc, ub], args.min_edge, args.min_books)
-            print_results(value_bets, args.min_edge)
+                value_bets = compute_value_bets([wm, bc, ub], args.min_edge, args.min_books)
+                print_results(value_bets, args.min_edge)
+
+                if args.output:
+                    import dataclasses
+                    with open(args.output, 'w', encoding='utf-8') as f:
+                        json.dump([dataclasses.asdict(v) for v in value_bets],
+                                  f, ensure_ascii=False, indent=2)
+                    print(f'\nRésultats exportés → {args.output}')
+
+                if not interval:
+                    break
+
+                print(f'\nProchain refresh dans {interval}s…  [Ctrl+C pour quitter]', flush=True)
+                _time.sleep(interval)
+
+        except KeyboardInterrupt:
+            print('\nArrêt.')
 
     else:
-        # Chargement depuis fichiers
+        # ── Chargement depuis fichiers JSON ──
         def load(path: str | None, parser_fn, name: str) -> dict:
             if not path:
                 print(f'  {name}: non fourni, ignoré')
@@ -566,12 +619,12 @@ def main():
         value_bets = compute_value_bets([wm, bc, ub], args.min_edge, args.min_books)
         print_results(value_bets, args.min_edge)
 
-    if args.output and 'value_bets' in dir():
-        import dataclasses
-        with open(args.output, 'w', encoding='utf-8') as f:
-            json.dump([dataclasses.asdict(v) for v in value_bets], f,
-                      ensure_ascii=False, indent=2)
-        print(f'\nRésultats exportés → {args.output}')
+        if args.output:
+            import dataclasses
+            with open(args.output, 'w', encoding='utf-8') as f:
+                json.dump([dataclasses.asdict(v) for v in value_bets],
+                          f, ensure_ascii=False, indent=2)
+            print(f'\nRésultats exportés → {args.output}')
 
 
 if __name__ == '__main__':
