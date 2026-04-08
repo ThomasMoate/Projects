@@ -421,6 +421,16 @@ def parse_winamax_football(data: list[dict]) -> dict:
                         result[mk][('double_chance', None)][side].append(
                             Offer('winamax', o['odd'], o['label']))
 
+            # ── Mi-temps 1X2 ──
+            elif norm_name == 'mi-temps - resultat':
+                for o in outcomes:
+                    if _is_draw_label(o['label']):
+                        side = 'draw'
+                    else:
+                        side = _football_side(o['label'], _tp, mk)
+                    result[mk][('half_time_1x2', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
+
     return result
 
 
@@ -470,6 +480,16 @@ def parse_betclic_football(data: list[dict]) -> dict:
                     if side != 'unknown':
                         result[mk][('double_chance', None)][side].append(
                             Offer('betclic', o['odds'], o['name']))
+
+            # ── Mi-temps 1X2 ──
+            elif '1ere mi-temps' in norm_name and 'resultat' in norm_name:
+                for o in outcomes:
+                    if _is_draw_label(o['name']):
+                        side = 'draw'
+                    else:
+                        side = _football_side(o['name'], _tp, mk)
+                    result[mk][('half_time_1x2', None)][side].append(
+                        Offer('betclic', o['odds'], o['name']))
 
     return result
 
@@ -538,6 +558,9 @@ def parse_winamax_basketball(data: list[dict]) -> dict:
     for m in data:
         mk = match_key(m['title'])
         sp = mk
+        _tp = re.split(r'\s+(?:[-–]|vs\.?)\s+', m['title'], flags=re.I)
+        if len(_tp) != 2:
+            _tp = ['', '']
         for bet in m.get('bets', []):
             name      = bet['name']
             norm_name = norm(name)
@@ -558,6 +581,19 @@ def parse_winamax_basketball(data: list[dict]) -> dict:
                     if line and over is not None:
                         result[mk][('total_points', line)]['over' if over else 'under'].append(
                             Offer('winamax', o['odd'], o['label']))
+
+            # ── Handicap spread : "Écart de points (handicap)" ──
+            elif norm_name == 'ecart de points (handicap)':
+                for o in outcomes:
+                    raw_label = o['label']
+                    spread_m = re.search(r'([+-]\d+[.,]\d+|\d+[.,]\d+)\s*$', raw_label)
+                    if not spread_m:
+                        continue
+                    line = abs(float(spread_m.group(1).replace(',', '.')))
+                    team_name = raw_label[:spread_m.start()].strip()
+                    side = _football_side(team_name, _tp, mk)
+                    result[mk][('handicap_spread', line)][side].append(
+                        Offer('winamax', o['odd'], raw_label))
 
     return result
 
@@ -596,6 +632,9 @@ def parse_unibet_basketball(data: list[dict]) -> dict:
     for m in data:
         mk = match_key(m['title'])
         sp = mk
+        _tp = re.split(r'\s+(?:[-–]|vs\.?)\s+', m['title'], flags=re.I)
+        if len(_tp) != 2:
+            _tp = ['', '']
         for mkt in m.get('markets', []):
             name      = mkt['name']
             norm_name = norm(name)
@@ -608,6 +647,19 @@ def parse_unibet_basketball(data: list[dict]) -> dict:
                     side = _wm_player_side(o.get('label', ''), sp)
                     result[mk][('match_winner', None)][side].append(
                         Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── Handicap spread : "Face à Face Handicap (Points) [-9,5]" ──
+            elif re.search(r'face a face handicap|handicap.*point', norm_name):
+                line_m = re.search(r'\[([+-]?\d+[.,]\d+)\]', name)
+                if not line_m:
+                    continue
+                line = abs(float(line_m.group(1).replace(',', '.')))
+                for o in outcomes:
+                    oc_label = o.get('label', '')
+                    team_name = re.sub(r'\s*\[[^\]]*\]\s*$', '', oc_label).strip()
+                    side = _football_side(team_name, _tp, mk)
+                    result[mk][('handicap_spread', line)][side].append(
+                        Offer('unibet', o['odd'], oc_label))
 
             # ── Total points ──
             elif cat == 'points' or re.search(r'point', norm_name):
@@ -663,6 +715,8 @@ def _market_label(key) -> str:
         'player_breaks':     'Breaks joueur',
         'btts':              'Les 2 équipes marquent',
         'double_chance':     'Double chance',
+        'half_time_1x2':     'MT 1X2',
+        'handicap_spread':   'Handicap',
     }
     base = labels.get(market, market)
     if len(key) == 3 and key[2] not in ('over', 'under', 'p0', 'p1', 'home', 'away', 'draw'):
@@ -704,7 +758,7 @@ def compute_value_bets(
                     merged[group_key][side].extend(offers)
 
         for group_key, sides in merged.items():
-            THREE_WAY = group_key[0] == 'match_winner_1x2'
+            THREE_WAY = group_key[0] in ('match_winner_1x2', 'half_time_1x2')
             DC        = group_key[0] == 'double_chance'
             line = group_key[1] if len(group_key) > 1 else None
 
@@ -807,7 +861,7 @@ def compute_value_bets(
 
             else:
                 # ── Marché 2-way (tennis, basket, over/under, BTTS) ───────────
-                if group_key[0] == 'match_winner':
+                if group_key[0] in ('match_winner', 'handicap_spread'):
                     side_pair = ('p0', 'p1')
                 elif group_key[0] == 'btts':
                     side_pair = ('yes', 'no')
@@ -935,9 +989,9 @@ def detect_surebets(
                 continue
 
             # Determine side pairs
-            if market_type == 'match_winner_1x2':
+            if market_type in ('match_winner_1x2', 'half_time_1x2'):
                 side_keys = ('p0', 'draw', 'p1')
-            elif market_type == 'match_winner':
+            elif market_type in ('match_winner', 'handicap_spread'):
                 side_keys = ('p0', 'p1')
             elif market_type == 'btts':
                 side_keys = ('yes', 'no')
