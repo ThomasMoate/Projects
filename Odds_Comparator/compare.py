@@ -124,6 +124,26 @@ def _football_side(label: str, title_parts: list[str], sorted_keys: tuple[str, s
                 return 'p0' if key == sorted_keys[0] else 'p1'
     return _wm_player_side(label, sorted_keys)
 
+
+def _dc_side(label: str, title_parts: list[str], sorted_keys: tuple[str, str]) -> str:
+    """Détermine le côté double chance: 'p0_draw' (1X), 'draw_p1' (X2), 'p0_p1' (12)."""
+    parts = re.split(r'\s*/\s*|\s+ou\s+', label, flags=re.I)
+    has_draw = any(_is_draw_label(p.strip()) for p in parts)
+    sides = set()
+    for p in parts:
+        p = p.strip()
+        if _is_draw_label(p):
+            continue
+        sides.add(_football_side(p, title_parts, sorted_keys))
+    if has_draw and 'p0' in sides:
+        return 'p0_draw'
+    if has_draw and 'p1' in sides:
+        return 'draw_p1'
+    if 'p0' in sides and 'p1' in sides:
+        return 'p0_p1'
+    return 'unknown'
+
+
 def parse_winamax(data: list[dict]) -> dict:
     """→ {match_key: {(market, line): {'over'/'under'/'p0'/'p1': [Offer]}}}"""
     result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -385,6 +405,22 @@ def parse_winamax_football(data: list[dict]) -> dict:
                         result[mk][('total_goals', line)]['over' if over else 'under'].append(
                             Offer('winamax', o['odd'], o['label']))
 
+            # ── BTTS ──
+            elif norm_name in ('les 2 equipes marquent', 'les deux equipes marquent'):
+                for o in outcomes:
+                    ln = norm(o['label'])
+                    side = 'yes' if ln in ('oui', 'yes') else 'no'
+                    result[mk][('btts', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
+
+            # ── Double chance ──
+            elif norm_name == 'double chance' and bet.get('category') in ('Résultat', ''):
+                for o in outcomes:
+                    side = _dc_side(o['label'], _tp, mk)
+                    if side != 'unknown':
+                        result[mk][('double_chance', None)][side].append(
+                            Offer('winamax', o['odd'], o['label']))
+
     return result
 
 
@@ -419,6 +455,22 @@ def parse_betclic_football(data: list[dict]) -> dict:
                         result[mk][('total_goals', line)]['over' if over else 'under'].append(
                             Offer('betclic', o['odds'], o['name']))
 
+            # ── BTTS ──
+            elif norm_name == 'les 2 equipes marquent':
+                for o in outcomes:
+                    ln = norm(o['name'])
+                    side = 'yes' if ln in ('oui', 'yes') else 'no'
+                    result[mk][('btts', None)][side].append(
+                        Offer('betclic', o['odds'], o['name']))
+
+            # ── Double chance ──
+            elif norm_name == 'double chance':
+                for o in outcomes:
+                    side = _dc_side(o['name'], _tp, mk)
+                    if side != 'unknown':
+                        result[mk][('double_chance', None)][side].append(
+                            Offer('betclic', o['odds'], o['name']))
+
     return result
 
 
@@ -450,8 +502,8 @@ def parse_unibet_football(data: list[dict]) -> dict:
                     result[mk][('match_winner_1x2', None)][side].append(
                         Offer('unibet', o['odd'], o.get('label', '')))
 
-            # ── Total buts ──
-            elif cat == 'buts' or re.search(r'but', norm_name):
+            # ── Total buts : "Plus / Moins X.5 But(s)" ──
+            elif re.search(r'\bbut', norm_name) and not re.search(r'equipe|buteur|1er but|dernier', norm_name):
                 line = extract_line(name)
                 if line:
                     for o in outcomes:
@@ -459,6 +511,22 @@ def parse_unibet_football(data: list[dict]) -> dict:
                         if over is not None:
                             result[mk][('total_goals', line)]['over' if over else 'under'].append(
                                 Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── BTTS ──
+            elif norm_name.startswith('les 2 equipes marqueront'):
+                for o in outcomes:
+                    ln = norm(o.get('label', ''))
+                    side = 'yes' if ln in ('oui', 'yes') else 'no'
+                    result[mk][('btts', None)][side].append(
+                        Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── Double chance ──
+            elif norm_name == 'double chance':
+                for o in outcomes:
+                    side = _dc_side(o.get('label', ''), _tp, mk)
+                    if side != 'unknown':
+                        result[mk][('double_chance', None)][side].append(
+                            Offer('unibet', o['odd'], o.get('label', '')))
 
     return result
 
@@ -593,6 +661,8 @@ def _market_label(key) -> str:
         'total_breaks':      'Total breaks',
         'player_aces':       'Aces joueur',
         'player_breaks':     'Breaks joueur',
+        'btts':              'Les 2 équipes marquent',
+        'double_chance':     'Double chance',
     }
     base = labels.get(market, market)
     if len(key) == 3 and key[2] not in ('over', 'under', 'p0', 'p1', 'home', 'away', 'draw'):
@@ -635,6 +705,7 @@ def compute_value_bets(
 
         for group_key, sides in merged.items():
             THREE_WAY = group_key[0] == 'match_winner_1x2'
+            DC        = group_key[0] == 'double_chance'
             line = group_key[1] if len(group_key) > 1 else None
 
             def best_by_bk(offers: list[Offer]) -> dict[str, float]:
@@ -644,7 +715,34 @@ def compute_value_bets(
                         d[o.bookmaker] = o.odds
                 return d
 
-            if THREE_WAY:
+            if DC:
+                # ── Double chance : 3 côtés indépendants, consensus simple ──────
+                _dc_labels = {'p0_draw': '1X', 'draw_p1': 'X2', 'p0_p1': '12'}
+                for dc_side, dc_lbl in _dc_labels.items():
+                    bk_dc = best_by_bk(sides.get(dc_side, []))
+                    if len(bk_dc) < min_books:
+                        continue
+                    probs = [1 / o for o in bk_dc.values()]
+                    avg_p = sum(probs) / len(probs)
+                    fair = 1 / avg_p
+                    for bk, odds in bk_dc.items():
+                        edge = (odds / fair - 1) * 100
+                        if edge >= min_edge:
+                            value_bets.append(ValueBet(
+                                match=' vs '.join(p.capitalize() for p in mk),
+                                market='Double chance',
+                                line=None,
+                                side=dc_lbl,
+                                bookmaker=bk,
+                                odds=odds,
+                                fair_odds=round(fair, 3),
+                                edge_pct=round(edge, 1),
+                                all_odds={k: v for k, v in bk_dc.items()},
+                                ref_source='consensus',
+                            ))
+                continue  # DC handled, no arb possible
+
+            elif THREE_WAY:
                 # ── Marché 3-way (1X2 football) ──────────────────────────────
                 if not all(s in sides for s in ('p0', 'p1', 'draw')):
                     continue
@@ -708,9 +806,11 @@ def compute_value_bets(
                             ))
 
             else:
-                # ── Marché 2-way (tennis, basket, over/under) ─────────────────
+                # ── Marché 2-way (tennis, basket, over/under, BTTS) ───────────
                 if group_key[0] == 'match_winner':
                     side_pair = ('p0', 'p1')
+                elif group_key[0] == 'btts':
+                    side_pair = ('yes', 'no')
                 else:
                     side_pair = ('over', 'under')
 
@@ -781,6 +881,125 @@ def compute_value_bets(
 
     return sorted(value_bets, key=lambda v: -v.edge_pct)
 
+
+# ── Arbitrage / Surebets ─────────────────────────────────────────────────────
+
+@dataclass
+class SurebetSide:
+    side: str          # 'p0' | 'p1' | 'draw' | 'over' | 'under' | 'yes' | 'no'
+    bookmaker: str
+    odds: float
+    stake_pct: float   # optimal stake as % of total stake
+
+@dataclass
+class Surebet:
+    match: str
+    market: str
+    line: float | None
+    profit_pct: float  # guaranteed profit as % of total stake
+    sides: list        # [SurebetSide, ...]
+
+
+def detect_surebets(
+    all_books: list[dict],
+    min_profit: float = 0.5,  # minimum profit % to report
+) -> list[Surebet]:
+    """
+    Détecte les surebets (arbitrages garantis) en cherchant les meilleures cotes
+    pour chaque côté d'un marché sur différents bookmakers.
+
+    Un surebet existe quand : sum(1 / best_odds_i) < 1
+    Profit garanti = (1/K - 1) × 100 %  où K = sum(1/best_odds_i)
+    """
+    all_match_keys: set = set()
+    for bk in all_books:
+        all_match_keys.update(bk.keys())
+
+    surebets: list[Surebet] = []
+
+    for mk in all_match_keys:
+        merged: dict = defaultdict(lambda: defaultdict(list))
+        for bk_data in all_books:
+            if mk not in bk_data:
+                continue
+            for group_key, sides in bk_data[mk].items():
+                for side, offers in sides.items():
+                    merged[group_key][side].extend(offers)
+
+        for group_key, sides in merged.items():
+            market_type = group_key[0]
+            line = group_key[1] if len(group_key) > 1 else None
+
+            # Double chance: outcomes not mutually exclusive → no arb possible
+            if market_type == 'double_chance':
+                continue
+
+            # Determine side pairs
+            if market_type == 'match_winner_1x2':
+                side_keys = ('p0', 'draw', 'p1')
+            elif market_type == 'match_winner':
+                side_keys = ('p0', 'p1')
+            elif market_type == 'btts':
+                side_keys = ('yes', 'no')
+            else:
+                side_keys = ('over', 'under')
+
+            if not all(s in sides for s in side_keys):
+                continue
+
+            # Best odds per side (best across all bookmakers)
+            best: dict[str, tuple[str, float]] = {}  # side → (bookmaker, odds)
+            for s in side_keys:
+                best_bk, best_odd = None, 0.0
+                for offer in sides[s]:
+                    if offer.odds > best_odd:
+                        best_odd = offer.odds
+                        best_bk  = offer.bookmaker
+                if best_bk:
+                    best[s] = (best_bk, best_odd)
+
+            if len(best) < len(side_keys):
+                continue
+
+            # Check arbitrage condition
+            K = sum(1 / best[s][1] for s in side_keys)
+            if K >= 1:
+                continue
+
+            profit = (1 / K - 1) * 100
+            if profit < min_profit:
+                continue
+
+            # Optimal stakes
+            arb_sides = [
+                SurebetSide(
+                    side=s,
+                    bookmaker=best[s][0],
+                    odds=best[s][1],
+                    stake_pct=round(100 * (1 / best[s][1]) / K, 1),
+                )
+                for s in side_keys
+            ]
+
+            # Side label for display
+            def _side_lbl(s):
+                if s == 'draw': return 'Nul'
+                if s in ('yes', 'no'): return 'Oui' if s == 'yes' else 'Non'
+                if s in ('over', 'under'): return 'Plus' if s == 'over' else 'Moins'
+                return _side_label(s, mk)
+
+            for arb in arb_sides:
+                arb.side = _side_lbl(arb.side)
+
+            surebets.append(Surebet(
+                match=' vs '.join(p.capitalize() for p in mk),
+                market=_market_label(group_key),
+                line=line,
+                profit_pct=round(profit, 2),
+                sides=arb_sides,
+            ))
+
+    return sorted(surebets, key=lambda s: -s.profit_pct)
 
 
 # ── Chargement dynamique des scrapers ─────────────────────────────────────────
@@ -934,6 +1153,28 @@ def print_results(value_bets: list[ValueBet], min_edge: float):
               f'(juste: {vb.fair_odds:.2f} {src_tag})  edge: +{vb.edge_pct:.1f}%')
 
 
+def print_surebets(surebets: list[Surebet], min_profit: float):
+    if not surebets:
+        print(f'\nAucun surebet détecté (profit min: {min_profit}%).')
+        return
+
+    print(f'\n{"═"*80}')
+    print(f'  SUREBETS — {len(surebets)} arbitrage(s) détecté(s)  (profit min: {min_profit}%)')
+    print(f'{"═"*80}')
+
+    prev_match = None
+    for sb in surebets:
+        if sb.match != prev_match:
+            print(f'\n  ► {sb.match}')
+            prev_match = sb.match
+
+        line_str = f' {sb.line}' if sb.line is not None else ''
+        print(f'    [{sb.market}{line_str}]  profit garanti: +{sb.profit_pct:.2f}%')
+        for s in sb.sides:
+            print(f'      {s.side:<6}  {s.bookmaker.upper():<10}  cote {s.odds:.2f}  '
+                  f'→ mise {s.stake_pct:.1f}%')
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -954,6 +1195,10 @@ def main():
                         help='Nbre min de bookmakers pour le consensus (défaut: 2)')
     parser.add_argument('--no-reference', action='store_true',
                         help='Désactiver la source de référence no-vig (Pinnacle/Odds API)')
+    parser.add_argument('--min-profit', type=float, default=0.5,
+                        help='Profit min %% pour les surebets (défaut: 0.5)')
+    parser.add_argument('--no-arb', action='store_true',
+                        help='Ne pas afficher les surebets')
     parser.add_argument('--output', help='Exporter les value bets en JSON')
     args = parser.parse_args()
 
@@ -993,6 +1238,10 @@ def main():
                     [wm, bc, ub], ref_odds, args.min_edge, args.min_books
                 )
                 print_results(value_bets, args.min_edge)
+
+                if not args.no_arb:
+                    surebets = detect_surebets([wm, bc, ub], args.min_profit)
+                    print_surebets(surebets, args.min_profit)
 
                 if args.output:
                     import dataclasses
@@ -1037,6 +1286,10 @@ def main():
 
         value_bets = compute_value_bets([wm, bc, ub], None, args.min_edge, args.min_books)
         print_results(value_bets, args.min_edge)
+
+        if not args.no_arb:
+            surebets = detect_surebets([wm, bc, ub], args.min_profit)
+            print_surebets(surebets, args.min_profit)
 
         if args.output:
             import dataclasses
