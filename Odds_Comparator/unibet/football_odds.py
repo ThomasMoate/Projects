@@ -20,17 +20,17 @@ from unibet_client import UnibetClient
 
 SPORT_CODE = 'FOOT'
 
-# Market display group IDs for football (may need adjustment after testing)
+# Market display group IDs for football (verified against live API)
 MARKET_GROUPS: dict[int, str] = {
-    1:   'Résultat',          # 1X2
-    2:   'Handicap',          # Asian handicap
-    5:   'Buts',              # Total goals
-    60:  'Buts (O/U)',        # alternate total goals group
-    700: 'Les deux équipes marquent',
-    4:   'Score exact',
-    8:   'Double chance',
-    9:   'Mi-Temps',
-    10:  'Mi-Temps/Match',
+    546: 'Principal',         # main markets (1X2, totals, double chance…)
+    7:   'Résultat',          # result / winner related
+    9:   'Buts',              # goals / totals
+    12:  'Double Chance',
+    17:  'Score Exact',
+    208: 'Premier But',
+    283: 'Mi-Temps Résultat',
+    284: 'Combiné',
+    285: 'Qualification',
 }
 
 

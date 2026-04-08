@@ -20,15 +20,16 @@ from unibet_client import UnibetClient
 
 SPORT_CODE = 'BASK'
 
-# Market display group IDs for basketball (may need adjustment after testing)
+# Market display group IDs for basketball (verified against live API)
 MARKET_GROUPS: dict[int, str] = {
-    1:   'Résultat',          # 2-way winner
-    2:   'Handicap',          # point spread
-    5:   'Points',            # total points over/under
-    50:  'Points (O/U)',      # alternate total points group
-    9:   'Mi-Temps',
-    11:  'Quarts',
-    12:  '1er Quart',
+    544: 'Principal',         # main markets (winner, totals…)
+    21:  'Résultat',          # Face à Face / winner
+    22:  'Points',            # total points over/under
+    23:  'Handicap',          # point spread
+    24:  'Combiné',
+    25:  'Joueur',            # player props
+    61:  'Écart',
+    821: 'Joueur (O/U)',      # player over/under
 }
 
 

@@ -100,6 +100,30 @@ def _wm_player_side(label: str, sorted_players: tuple[str, str]) -> str:
     s1 = SequenceMatcher(None, ln, sorted_players[1]).ratio()
     return 'p0' if s0 >= s1 else 'p1'
 
+
+def _football_side(label: str, title_parts: list[str], sorted_keys: tuple[str, str]) -> str:
+    """Side detection for football: handles short labels like 'Atalanta' vs 'Atalanta Bergame'."""
+    lname = last_name(label)
+    if lname == sorted_keys[0]:
+        return 'p0'
+    if lname == sorted_keys[1]:
+        return 'p1'
+    ln = norm(label)
+    # Substring containment: label in team name or vice versa
+    for part in title_parts:
+        pn = norm(part)
+        if ln in pn or pn in ln:
+            key = last_name(part)
+            return 'p0' if key == sorted_keys[0] else 'p1'
+    # Word-level: any word (≥4 chars) of label found in team name
+    for part in title_parts:
+        pn = norm(part)
+        for word in ln.split():
+            if len(word) >= 4 and word in pn.split():
+                key = last_name(part)
+                return 'p0' if key == sorted_keys[0] else 'p1'
+    return _wm_player_side(label, sorted_keys)
+
 def parse_winamax(data: list[dict]) -> dict:
     """→ {match_key: {(market, line): {'over'/'under'/'p0'/'p1': [Offer]}}}"""
     result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -332,21 +356,23 @@ def _is_draw_label(label: str) -> bool:
 def parse_winamax_football(data: list[dict]) -> dict:
     result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for m in data:
-        mk = match_key(m['title'])
-        sp = mk
+        mk  = match_key(m['title'])
+        _tp = re.split(r'\s+(?:[-–]|vs\.?)\s+', m['title'], flags=re.I)
+        if len(_tp) != 2:
+            _tp = ['', '']
         for bet in m.get('bets', []):
             name      = bet['name']
             norm_name = norm(name)
             outcomes  = bet.get('outcomes', [])
 
-            # ── 1X2 ──
-            if norm_name in ('résultat', '1x2', 'resultat du match', '1 x 2') \
-               or (norm_name == 'résultat' and bet.get('category') == 'Match'):
+            # ── 1X2 : "Résultat" (cat=Match) ou "1X2" ──
+            if norm_name in ('resultat', '1x2', 'resultat du match', '1 x 2') \
+               or (norm_name == 'resultat' and bet.get('category') == 'Match'):
                 for o in outcomes:
                     if _is_draw_label(o['label']):
                         side = 'draw'
                     else:
-                        side = _wm_player_side(o['label'], sp)
+                        side = _football_side(o['label'], _tp, mk)
                     result[mk][('match_winner_1x2', None)][side].append(
                         Offer('winamax', o['odd'], o['label']))
 
@@ -365,25 +391,27 @@ def parse_winamax_football(data: list[dict]) -> dict:
 def parse_betclic_football(data: list[dict]) -> dict:
     result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for m in data:
-        mk = match_key(m['title'])
-        sp = mk
+        mk  = match_key(m['title'])
+        _tp = re.split(r'\s+(?:[-–]|vs\.?)\s+', m['title'], flags=re.I)
+        if len(_tp) != 2:
+            _tp = ['', '']
         for mkt in m.get('markets', []):
             name      = mkt['name']
             norm_name = norm(name)
             outcomes  = mkt.get('outcomes', [])
 
-            # ── 1X2 ──
-            if norm_name in ('résultat du match', 'résultat', '1x2'):
+            # ── 1X2 : "Résultat du match (tps rég.)" ou variantes ──
+            if norm_name.startswith('resultat du match') or norm_name in ('resultat', '1x2'):
                 for o in outcomes:
                     if _is_draw_label(o['name']):
                         side = 'draw'
                     else:
-                        side = _wm_player_side(o['name'], sp)
+                        side = _football_side(o['name'], _tp, mk)
                     result[mk][('match_winner_1x2', None)][side].append(
                         Offer('betclic', o['odds'], o['name']))
 
-            # ── Total buts ──
-            elif re.search(r'nombre total de buts|total buts|buts', norm_name):
+            # ── Total buts : "Nombre total de buts" (match entier seulement) ──
+            elif norm_name.startswith('nombre total de buts') or norm_name == 'total buts':
                 for o in outcomes:
                     line = extract_line(o['name'])
                     over = is_over(o['name'])
@@ -397,26 +425,28 @@ def parse_betclic_football(data: list[dict]) -> dict:
 def parse_unibet_football(data: list[dict]) -> dict:
     result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for m in data:
-        mk = match_key(m['title'])
-        sp = mk
+        mk  = match_key(m['title'])
+        _tp = re.split(r'\s+(?:[-–]|vs\.?)\s+', m['title'], flags=re.I)
+        if len(_tp) != 2:
+            _tp = ['', '']
         for mkt in m.get('markets', []):
             name      = mkt['name']
             norm_name = norm(name)
             cat       = norm(mkt.get('category', ''))
             outcomes  = mkt.get('outcomes', [])
 
-            # ── 1X2 : détection par nom ou par présence d'un résultat nul ──
+            # ── 1X2 : "1 N 2" ou présence d'un résultat nul parmi 3 issues ──
             is_1x2 = (
-                cat == 'résultat' or
-                norm_name in ('résultat', 'résultat du match', '1x2') or
-                any(_is_draw_label(o.get('label', '')) for o in outcomes) and len(outcomes) == 3
+                cat in ('resultat', 'principal') or
+                norm_name in ('resultat', 'resultat du match', '1x2', '1 n 2') or
+                (any(_is_draw_label(o.get('label', '')) for o in outcomes) and len(outcomes) == 3)
             )
             if is_1x2:
                 for o in outcomes:
                     if _is_draw_label(o.get('label', '')):
                         side = 'draw'
                     else:
-                        side = _wm_player_side(o.get('label', ''), sp)
+                        side = _football_side(o.get('label', ''), _tp, mk)
                     result[mk][('match_winner_1x2', None)][side].append(
                         Offer('unibet', o['odd'], o.get('label', '')))
 
@@ -504,8 +534,8 @@ def parse_unibet_basketball(data: list[dict]) -> dict:
             cat       = norm(mkt.get('category', ''))
             outcomes  = mkt.get('outcomes', [])
 
-            # ── Vainqueur 2-way ──
-            if cat == 'résultat' and len(outcomes) == 2:
+            # ── Vainqueur 2-way : "Face à Face" ou "Résultat" ──
+            if norm_name in ('face a face', 'vainqueur', 'resultat') and len(outcomes) == 2:
                 for o in outcomes:
                     side = _wm_player_side(o.get('label', ''), sp)
                     result[mk][('match_winner', None)][side].append(
@@ -758,14 +788,14 @@ def compute_value_bets(
 _SCRIPT_DIR = Path(__file__).parent
 
 
-def _load_scraper(subdir: str):
-    """Importe tennis_odds depuis le sous-dossier sans passer par subprocess."""
+def _load_scraper(subdir: str, filename: str = 'tennis_odds'):
+    """Importe le module <filename> depuis le sous-dossier donné."""
     import importlib.util as _ilu
     subdir_path = _SCRIPT_DIR / subdir
     path_str = str(subdir_path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
-    spec = _ilu.spec_from_file_location(f'_{subdir}_odds', subdir_path / 'tennis_odds.py')
+    spec = _ilu.spec_from_file_location(f'_{subdir}_{filename}', subdir_path / f'{filename}.py')
     mod = _ilu.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -788,26 +818,27 @@ def fetch_all_odds(
 
     # ── Winamax ──────────────────────────────────────────────────────────────
     _WM_SPORT_ID  = {'tennis': 5, 'football': 1, 'basketball': 2}
+    # (subdir, filename, fn_name, extra_kwargs)
     _WM_SCRAPE_FN = {
-        'tennis':     ('winamax', 'scrape_all_tennis_odds',    {}),
-        'football':   ('winamax', 'scrape_all_football_odds',  {}),
-        'basketball': ('winamax', 'scrape_all_basketball_odds',{}),
+        'tennis':     ('winamax', 'tennis_odds',    'scrape_all_tennis_odds',    {}),
+        'football':   ('winamax', 'football_odds',  'scrape_all_football_odds',  {}),
+        'basketball': ('winamax', 'basketball_odds','scrape_all_basketball_odds',{}),
     }
     _BC_SCRAPE_FN = {
-        'tennis':     ('betclic', 'scrape_all_tennis',   {'all_categories': True}),
-        'football':   ('betclic', 'scrape_all_football', {'all_categories': True}),
-        'basketball': ('betclic', 'scrape_all_basketball',{'all_categories': True}),
+        'tennis':     ('betclic', 'tennis_odds',    'scrape_all_tennis',    {'all_categories': True}),
+        'football':   ('betclic', 'football_odds',  'scrape_all_football',  {'all_categories': True}),
+        'basketball': ('betclic', 'basketball_odds','scrape_all_basketball',{'all_categories': True}),
     }
     _UB_SCRAPE_FN = {
-        'tennis':     ('unibet', 'scrape_tennis_odds',    {}),
-        'football':   ('unibet', 'scrape_football_odds',  {}),
-        'basketball': ('unibet', 'scrape_basketball_odds',{}),
+        'tennis':     ('unibet', 'tennis_odds',    'scrape_tennis_odds',    {}),
+        'football':   ('unibet', 'football_odds',  'scrape_football_odds',  {}),
+        'basketball': ('unibet', 'basketball_odds','scrape_basketball_odds',{}),
     }
 
     def _run_winamax():
         try:
-            subdir, fn_name, extra = _WM_SCRAPE_FN[sport]
-            mod = _load_scraper(subdir)
+            subdir, filename, fn_name, extra = _WM_SCRAPE_FN[sport]
+            mod = _load_scraper(subdir, filename)
             sport_id = _WM_SPORT_ID.get(sport, 5)
             with mod.WinamaxClient(sport_id=sport_id) as c:
                 fn = getattr(mod, fn_name)
@@ -819,8 +850,8 @@ def fetch_all_odds(
 
     def _run_betclic():
         try:
-            subdir, fn_name, extra = _BC_SCRAPE_FN[sport]
-            mod = _load_scraper(subdir)
+            subdir, filename, fn_name, extra = _BC_SCRAPE_FN[sport]
+            mod = _load_scraper(subdir, filename)
             with mod.BetclicClient() as c:
                 fn = getattr(mod, fn_name)
                 matches = fn(c, prematch_only=prematch_only, **extra)
@@ -831,8 +862,8 @@ def fetch_all_odds(
 
     def _run_unibet():
         try:
-            subdir, fn_name, extra = _UB_SCRAPE_FN[sport]
-            mod = _load_scraper(subdir)
+            subdir, filename, fn_name, extra = _UB_SCRAPE_FN[sport]
+            mod = _load_scraper(subdir, filename)
             with mod.UnibetClient() as c:
                 fn = getattr(mod, fn_name)
                 matches = fn(c, prematch_only=prematch_only, **extra)
