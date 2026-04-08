@@ -349,6 +349,7 @@ class ValueBet:
     fair_odds: float
     edge_pct: float          # (odds/fair_odds - 1) * 100
     all_odds: dict           # {bk: odds}
+    ref_source: str = 'consensus'  # 'pinnacle' | 'oddsapi' | 'consensus'
 
 def no_vig_prob(odds_a: float, odds_b: float) -> tuple[float, float]:
     """Retourne (prob_no_vig_A, prob_no_vig_B) sans marge."""
@@ -381,14 +382,16 @@ def _side_label(side: str, match_players: tuple[str, str]) -> str:
 
 def compute_value_bets(
     all_books: list[dict],
+    ref_odds: dict | None = None,
     min_edge: float = 3.0,
     min_books: int = 2,       # au minimum 2 bookmakers pour calculer le consensus
 ) -> list[ValueBet]:
     """
-    Fusionne les données des 3 bookmakers et retourne les value bets.
+    Fusionne les données des bookmakers et retourne les value bets.
     all_books = [winamax_dict, betclic_dict, unibet_dict]
+    ref_odds  = {match_key: {market_key: {side: fair_odds, 'source': str}}}
+                (depuis ReferenceClient — Pinnacle no-vig de préférence)
     """
-    # Rassembler toutes les clés de matchs
     all_match_keys: set = set()
     for bk in all_books:
         all_match_keys.update(bk.keys())
@@ -396,7 +399,6 @@ def compute_value_bets(
     value_bets: list[ValueBet] = []
 
     for mk in all_match_keys:
-        # Fusionner les marchés de ce match depuis tous les bookmakers
         merged: dict = defaultdict(lambda: defaultdict(list))
         for bk_data in all_books:
             if mk not in bk_data:
@@ -405,9 +407,7 @@ def compute_value_bets(
                 for side, offers in sides.items():
                     merged[group_key][side].extend(offers)
 
-        # Pour chaque groupe (market, line) : calculer la fair value
         for group_key, sides in merged.items():
-            # Identifier les 2 côtés attendus
             if group_key[0] == 'match_winner':
                 side_pair = ('p0', 'p1')
             else:
@@ -417,7 +417,6 @@ def compute_value_bets(
             if s_a not in sides or s_b not in sides:
                 continue
 
-            # Construire {bk: best_odds} pour chaque côté
             def best_by_bk(offers: list[Offer]) -> dict[str, float]:
                 d: dict[str, float] = {}
                 for o in offers:
@@ -428,29 +427,46 @@ def compute_value_bets(
             bk_a = best_by_bk(sides[s_a])
             bk_b = best_by_bk(sides[s_b])
 
-            # Bookmakers communs (ont les 2 côtés)
+            # ── Référence Pinnacle / Odds API (no-vig) ───────────────────────
+            ref_fair_a: float | None = None
+            ref_fair_b: float | None = None
+            ref_src = ''
+            if ref_odds:
+                ref_match = ref_odds.get(mk)
+                if ref_match:
+                    ref_mkt = ref_match.get(group_key)
+                    if ref_mkt:
+                        ref_fair_a = ref_mkt.get(s_a)
+                        ref_fair_b = ref_mkt.get(s_b)
+                        ref_src = ref_mkt.get('source', 'pinnacle')
+
+            # ── Consensus soft books ─────────────────────────────────────────
+            fair_a_cons: float | None = None
+            fair_b_cons: float | None = None
             common = set(bk_a) & set(bk_b)
-            if len(common) < min_books:
+            if len(common) >= min_books:
+                probs_a, probs_b = [], []
+                for bk in common:
+                    pa, pb = no_vig_prob(bk_a[bk], bk_b[bk])
+                    probs_a.append(pa)
+                    probs_b.append(pb)
+                ca = sum(probs_a) / len(probs_a)
+                cb = sum(probs_b) / len(probs_b)
+                fair_a_cons = 1 / ca if ca > 0 else 9999
+                fair_b_cons = 1 / cb if cb > 0 else 9999
+
+            # ── Choisir la meilleure référence ───────────────────────────────
+            if ref_fair_a is not None and ref_fair_b is not None:
+                fair_a, fair_b = ref_fair_a, ref_fair_b
+                fair_source = ref_src
+            elif fair_a_cons is not None:
+                fair_a, fair_b = fair_a_cons, fair_b_cons
+                fair_source = 'consensus'
+            else:
                 continue
-
-            # Calculer la proba no-vig pour chaque bk commun
-            probs_a, probs_b = [], []
-            for bk in common:
-                pa, pb = no_vig_prob(bk_a[bk], bk_b[bk])
-                probs_a.append(pa)
-                probs_b.append(pb)
-
-            # Consensus = moyenne des probas no-vig
-            consensus_a = sum(probs_a) / len(probs_a)
-            consensus_b = sum(probs_b) / len(probs_b)
-
-            # Fair odds
-            fair_a = 1 / consensus_a if consensus_a > 0 else 9999
-            fair_b = 1 / consensus_b if consensus_b > 0 else 9999
 
             line = group_key[1] if len(group_key) > 1 else None
 
-            # Vérifier chaque bookmaker pour chaque côté
             for (side, all_bk, fair_odds) in [
                 (s_a, bk_a, fair_a),
                 (s_b, bk_b, fair_b),
@@ -469,6 +485,7 @@ def compute_value_bets(
                             edge_pct=round(edge, 1),
                             all_odds={**{f'{k}(A)': v for k, v in bk_a.items()},
                                       **{f'{k}(B)': v for k, v in bk_b.items()}},
+                            ref_source=fair_source,
                         ))
 
     return sorted(value_bets, key=lambda v: -v.edge_pct)
@@ -493,16 +510,19 @@ def _load_scraper(subdir: str):
     return mod
 
 
-def fetch_all_odds(prematch_only: bool = True) -> tuple[list, list, list]:
-    """Fetch odds from all 3 bookmakers in parallel threads.
+def fetch_all_odds(
+    prematch_only: bool = True,
+    with_reference: bool = True,
+) -> tuple[list, list, list, dict]:
+    """Fetch odds from all 3 bookmakers + reference source in parallel threads.
 
-    Returns (winamax_raw, betclic_raw, unibet_raw) as lists of dicts
-    ready to be passed to parse_winamax / parse_betclic / parse_unibet.
+    Returns (winamax_raw, betclic_raw, unibet_raw, ref_odds).
+    ref_odds is {} when no reference source is configured.
     """
     import dataclasses
     import threading as _th
 
-    results: dict[str, list] = {'winamax': [], 'betclic': [], 'unibet': []}
+    results: dict = {'winamax': [], 'betclic': [], 'unibet': [], 'reference': {}}
 
     def _run_winamax():
         try:
@@ -536,17 +556,42 @@ def fetch_all_odds(prematch_only: bool = True) -> tuple[list, list, list]:
         except Exception as e:
             print(f'  unibet  : ERREUR — {e}', file=sys.stderr, flush=True)
 
+    def _run_reference():
+        if not with_reference:
+            return
+        try:
+            ref_path = str(_SCRIPT_DIR / 'reference')
+            if ref_path not in sys.path:
+                sys.path.insert(0, ref_path)
+            from reference_client import ReferenceClient
+            with ReferenceClient() as ref:
+                if ref.is_available():
+                    results['reference'] = ref.get_reference_odds()
+                    print(
+                        f'  référence ({ref.source_name()}): {len(results["reference"])} matchs',
+                        flush=True,
+                    )
+                else:
+                    print(
+                        '  référence: non configurée '
+                        '(définissez PINNACLE_USER+PINNACLE_PASS ou ODDS_API_KEY)',
+                        flush=True,
+                    )
+        except Exception as e:
+            print(f'  référence: ERREUR — {e}', file=sys.stderr, flush=True)
+
     threads = [
-        _th.Thread(target=_run_winamax, daemon=True),
-        _th.Thread(target=_run_betclic, daemon=True),
-        _th.Thread(target=_run_unibet,  daemon=True),
+        _th.Thread(target=_run_winamax,   daemon=True),
+        _th.Thread(target=_run_betclic,   daemon=True),
+        _th.Thread(target=_run_unibet,    daemon=True),
+        _th.Thread(target=_run_reference, daemon=True),
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    return results['winamax'], results['betclic'], results['unibet']
+    return results['winamax'], results['betclic'], results['unibet'], results['reference']
 
 
 # ── Affichage ────────────────────────────────────────────────────────────────
@@ -567,9 +612,10 @@ def print_results(value_bets: list[ValueBet], min_edge: float):
             prev_match = vb.match
 
         line_str = f' {vb.line}' if vb.line is not None else ''
+        src_tag = f'[{vb.ref_source}]' if vb.ref_source != 'consensus' else '[consensus]'
         print(f'    [{vb.market}{line_str}] {vb.side}')
         print(f'      {vb.bookmaker.upper():10s} cote {vb.odds:.2f}  '
-              f'(juste: {vb.fair_odds:.2f})  edge: +{vb.edge_pct:.1f}%')
+              f'(juste: {vb.fair_odds:.2f} {src_tag})  edge: +{vb.edge_pct:.1f}%')
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -587,8 +633,12 @@ def main():
                         help='Edge minimum en %% (défaut: 3.0)')
     parser.add_argument('--min-books', type=int, default=2,
                         help='Nbre min de bookmakers pour le consensus (défaut: 2)')
+    parser.add_argument('--no-reference', action='store_true',
+                        help='Désactiver la source de référence no-vig (Pinnacle/Odds API)')
     parser.add_argument('--output', help='Exporter les value bets en JSON')
     args = parser.parse_args()
+
+    with_ref = not args.no_reference
 
     live_mode = args.watch is not None
     do_fetch  = args.fetch or live_mode
@@ -606,13 +656,17 @@ def main():
                 ts = _time.strftime('%H:%M:%S')
                 print(f'[{ts}] Récupération des cotes en parallèle…', flush=True)
 
-                wm_raw, bc_raw, ub_raw = fetch_all_odds(prematch_only=True)
+                wm_raw, bc_raw, ub_raw, ref_odds = fetch_all_odds(
+                    prematch_only=True, with_reference=with_ref
+                )
 
                 wm = parse_winamax(wm_raw)
                 bc = parse_betclic(bc_raw)
                 ub = parse_unibet(ub_raw)
 
-                value_bets = compute_value_bets([wm, bc, ub], args.min_edge, args.min_books)
+                value_bets = compute_value_bets(
+                    [wm, bc, ub], ref_odds, args.min_edge, args.min_books
+                )
                 print_results(value_bets, args.min_edge)
 
                 if args.output:
@@ -650,7 +704,7 @@ def main():
         bc = load(args.betclic, parse_betclic, 'Betclic')
         ub = load(args.unibet,  parse_unibet,  'Unibet')
 
-        value_bets = compute_value_bets([wm, bc, ub], args.min_edge, args.min_books)
+        value_bets = compute_value_bets([wm, bc, ub], None, args.min_edge, args.min_books)
         print_results(value_bets, args.min_edge)
 
         if args.output:
