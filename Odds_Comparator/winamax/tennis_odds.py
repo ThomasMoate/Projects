@@ -3,9 +3,12 @@ Scrape all tennis odds from Winamax, including specialized markets
 (aces, breaks, sets, etc.).
 
 Usage:
-    python tennis_odds.py                  # print summary to stdout
-    python tennis_odds.py --output odds.json   # also write to JSON file
-    python tennis_odds.py --match 70456558     # single match only
+    python tennis_odds.py                            # all matches, print summary
+    python tennis_odds.py --output odds.json         # write results to JSON
+    python tennis_odds.py --prematch-only            # skip live matches
+    python tennis_odds.py --specialized-only         # only aces/breaks matches
+    python tennis_odds.py --match 70456558           # single match by ID
+    python tennis_odds.py --delay 0.5                # slower polling (default: 0.3s)
 """
 
 import argparse
@@ -125,6 +128,7 @@ def _parse_match_data(data: dict) -> Optional[MatchOdds]:
 def scrape_all_tennis_odds(
     client: WinamaxClient,
     only_specialized: bool = False,
+    prematch_only: bool = False,
     delay: float = 0.3,
 ) -> list[MatchOdds]:
     """
@@ -148,6 +152,9 @@ def scrape_all_tennis_odds(
         title = m.get('title', str(match_id))
         status = m.get('status', '')
         filters = m.get('filters', [])
+
+        if prematch_only and status != 'PREMATCH':
+            continue
 
         has_specialized = any(f in SPECIALIZED_FILTER_IDS for f in filters)
 
@@ -207,6 +214,8 @@ def main():
     parser = argparse.ArgumentParser(description='Scrape Winamax tennis odds')
     parser.add_argument('--output', '-o', help='Write results to JSON file')
     parser.add_argument('--match', '-m', type=int, help='Scrape a single match ID')
+    parser.add_argument('--prematch-only', action='store_true',
+                        help='Skip live matches (PREMATCH status only)')
     parser.add_argument(
         '--specialized-only', action='store_true',
         help='Only fetch matches with aces/breaks/specialized markets'
@@ -226,6 +235,7 @@ def main():
             matches = scrape_all_tennis_odds(
                 client,
                 only_specialized=args.specialized_only,
+                prematch_only=args.prematch_only,
                 delay=args.delay,
             )
 

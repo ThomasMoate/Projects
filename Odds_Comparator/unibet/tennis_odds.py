@@ -2,10 +2,12 @@
 Scrape all tennis odds from Unibet France, including aces and breaks markets.
 
 Usage:
-    python tennis_odds.py                          # all leagues, all markets
-    python tennis_odds.py --specialized-only       # only aces/breaks matches
-    python tennis_odds.py --output odds.json       # write to JSON
-    python tennis_odds.py --league 58523439        # single league (Monte Carlo)
+    python tennis_odds.py                            # all leagues, all markets
+    python tennis_odds.py --output odds.json         # write results to JSON
+    python tennis_odds.py --prematch-only            # skip live matches
+    python tennis_odds.py --specialized-only         # only aces/breaks matches
+    python tennis_odds.py --league 58523439          # single league by ID
+    python tennis_odds.py --delay 0.5                # slower polling (default: 0.25s)
 """
 import argparse
 import json
@@ -103,6 +105,7 @@ def scrape_tennis_odds(
     client: UnibetClient,
     league_ids: Optional[list[int]] = None,
     only_specialized: bool = False,
+    prematch_only: bool = False,
     delay: float = 0.25,
 ) -> list[MatchOdds]:
     """
@@ -134,6 +137,9 @@ def scrape_tennis_odds(
                 raw = client.get_event_offers(event_id)
                 match = parse_event(event_id, raw)
                 match.league = lname
+
+                if prematch_only and match.status not in ('OPEN', ''):
+                    continue
 
                 if only_specialized and not (match.has_aces or match.has_breaks):
                     continue
@@ -185,6 +191,8 @@ def main():
     parser.add_argument('--output', '-o', help='Write JSON output to file')
     parser.add_argument('--league', '-l', type=int, action='append',
                         help='Filter to specific league ID (can repeat)')
+    parser.add_argument('--prematch-only', action='store_true',
+                        help='Skip live matches')
     parser.add_argument('--specialized-only', action='store_true',
                         help='Only fetch matches with aces/breaks markets')
     parser.add_argument('--delay', type=float, default=0.25,
@@ -196,6 +204,7 @@ def main():
             client,
             league_ids=args.league,
             only_specialized=args.specialized_only,
+            prematch_only=args.prematch_only,
             delay=args.delay,
         )
 

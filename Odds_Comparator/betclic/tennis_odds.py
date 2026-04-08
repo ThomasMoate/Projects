@@ -5,11 +5,13 @@ Note: Betclic does NOT offer aces or breaks markets for tennis.
 Markets available: match winner, set results, total games, handicap, points.
 
 Usage:
-    python tennis_odds.py                        # all matches, Le Top category (~7 markets)
-    python tennis_odds.py --output odds.json     # write to JSON
-    python tennis_odds.py --prematch-only        # skip live matches
-    python tennis_odds.py --all-categories       # all 5 categories (~34 unique markets)
-    python tennis_odds.py --category ca_ten_gms  # specific category (Jeux)
+    python tennis_odds.py                            # all matches, Le Top category (~7 markets)
+    python tennis_odds.py --output odds.json         # write results to JSON
+    python tennis_odds.py --prematch-only            # skip live matches
+    python tennis_odds.py --all-categories           # all 5 categories (~34 unique markets)
+    python tennis_odds.py --category ca_ten_gms      # specific category (Jeux)
+    python tennis_odds.py --max-seconds 15           # higher safety cap per stream (default: 8)
+    python tennis_odds.py --delay 0.5                # delay between matches (default: 0.0s)
 """
 import argparse
 import json
@@ -48,10 +50,10 @@ class MatchOdds:
 def scrape_all_tennis(
     client: BetclicClient,
     prematch_only: bool = False,
-    read_time: float = 5.0,
-    delay: float = 0.5,
+    max_seconds: float = 8.0,
     all_categories: bool = False,
     category_id: str | None = None,
+    delay: float = 0.0,
 ) -> list[MatchOdds]:
     """
     1. Fetch all tennis matches.
@@ -78,10 +80,10 @@ def scrape_all_tennis(
 
         try:
             if all_categories:
-                markets_raw = client.get_all_match_markets(match_id, read_seconds=read_time)
+                markets_raw = client.get_all_match_markets(match_id, max_seconds=max_seconds)
             else:
                 markets_raw = client.get_match_markets(
-                    match_id, read_seconds=read_time, category_id=category_id
+                    match_id, max_seconds=max_seconds, category_id=category_id
                 )
         except Exception as e:
             print(f'  ERROR: {e}', file=sys.stderr)
@@ -107,7 +109,8 @@ def scrape_all_tennis(
         ))
 
         print(f'  → {len(markets)} markets collected.', file=sys.stderr)
-        time.sleep(delay)
+        if delay:
+            time.sleep(delay)
 
     return results
 
@@ -128,10 +131,10 @@ def main():
     parser = argparse.ArgumentParser(description='Scrape Betclic France tennis odds')
     parser.add_argument('--output', '-o', help='Write results to JSON file')
     parser.add_argument('--prematch-only', action='store_true', help='Skip live matches')
-    parser.add_argument('--read-time', type=float, default=5.0,
-                        help='Seconds to read per match stream (default: 5)')
-    parser.add_argument('--delay', type=float, default=0.5,
-                        help='Delay between matches (default: 0.5s)')
+    parser.add_argument('--max-seconds', type=float, default=8.0,
+                        help='Safety cap (seconds) per stream request (default: 8)')
+    parser.add_argument('--delay', type=float, default=0.0,
+                        help='Delay between match requests (default: 0.0s)')
     parser.add_argument('--all-categories', action='store_true',
                         help='Fetch all 5 market categories in parallel (~34 markets)')
     parser.add_argument('--category', default=None,
@@ -143,10 +146,10 @@ def main():
         matches = scrape_all_tennis(
             client,
             prematch_only=args.prematch_only,
-            read_time=args.read_time,
-            delay=args.delay,
+            max_seconds=args.max_seconds,
             all_categories=args.all_categories,
             category_id=args.category,
+            delay=args.delay,
         )
 
     print(f'\nScraped {len(matches)} matches total.', file=sys.stderr)

@@ -11,6 +11,7 @@ Available categories (use category_id in get_match_markets):
 
 import struct
 import threading
+import time
 import urllib3
 import requests
 
@@ -189,35 +190,44 @@ class BetclicClient:
         self.session.headers.update({'User-Agent': self.UA})
         self.session.headers.update(self.GRPC_HEADERS)
 
-    def _stream(self, method: str, proto_body: bytes, read_seconds: float = 4.0) -> bytes:
-        """POST a gRPC-web request and read the streaming response for `read_seconds`.
+    def _stream(self, method: str, proto_body: bytes, max_seconds: float = 10.0, idle_secs: float = 0.5) -> bytes:
+        """POST a gRPC-web request and return accumulated response bytes.
 
-        Market data arrives within ~0.6s; 4s gives comfortable margin.
+        Stops as soon as the connection closes naturally OR no new data
+        has arrived for `idle_secs` (default 0.5s), whichever comes first.
+        `max_seconds` is a hard safety cap.
         """
         frame = _grpc_web_frame(proto_body)
         content = bytearray()
-        stop = threading.Event()
+        done = threading.Event()
+        last_recv: list[float] = [time.monotonic()]
 
         def _read():
             try:
                 resp = self.session.post(
                     f'{MATCH_SERVICE}/{method}',
                     data=frame, verify=False,
-                    timeout=(5, read_seconds + 5), stream=True,
+                    timeout=(5, max_seconds + 2), stream=True,
                 )
                 for chunk in resp.iter_content(chunk_size=None):
-                    if stop.is_set():
-                        break
                     content.extend(chunk)
+                    last_recv[0] = time.monotonic()
                     if len(content) > 2_000_000:
                         break
             except Exception:
                 pass
+            finally:
+                done.set()
 
         t = threading.Thread(target=_read, daemon=True)
         t.start()
-        t.join(timeout=read_seconds)
-        stop.set()
+        deadline = time.monotonic() + max_seconds
+        while not done.is_set():
+            if time.monotonic() > deadline:
+                break
+            if time.monotonic() - last_recv[0] > idle_secs:
+                break
+            time.sleep(0.05)
         t.join(timeout=2)
         return bytes(content)
 
@@ -250,7 +260,7 @@ class BetclicClient:
             _encode_int64(4, 0) +
             _encode_int64(5, limit)
         )
-        raw = self._stream('GetMatchesBySportWithNotifications', proto_body, read_seconds=8)
+        raw = self._stream('GetMatchesBySportWithNotifications', proto_body, max_seconds=10)
         frames = self._parse_frames(raw)
         matches = []
         for frame in frames:
@@ -284,7 +294,7 @@ class BetclicClient:
         self,
         match_id: int,
         language: str = 'fr',
-        read_seconds: float = 4.0,
+        max_seconds: float = 8.0,
         category_id: str | None = None,
     ) -> list[dict]:
         """
@@ -297,7 +307,7 @@ class BetclicClient:
         proto_body = _encode_int64(1, match_id) + _encode_string(2, language)
         if category_id:
             proto_body += _encode_string(3, category_id)
-        raw = self._stream('GetMatchWithNotification', proto_body, read_seconds=read_seconds)
+        raw = self._stream('GetMatchWithNotification', proto_body, max_seconds=max_seconds)
         frames = self._parse_frames(raw)
         all_markets: dict[int, dict] = {}
         for frame in frames:
@@ -335,7 +345,7 @@ class BetclicClient:
         self,
         match_id: int,
         language: str = 'fr',
-        read_seconds: float = 7.0,
+        max_seconds: float = 8.0,
         categories: list[str] | None = None,
     ) -> list[dict]:
         """
@@ -345,15 +355,14 @@ class BetclicClient:
         """
         if categories is None:
             categories = list(TENNIS_CATEGORIES.keys())
-        results: dict[int, dict] = {}
+        results: dict[str, dict] = {}
         threads = []
         lock = threading.Lock()
 
         def _fetch(cat_id: str):
-            mkts = self.get_match_markets(match_id, language, read_seconds, category_id=cat_id)
+            mkts = self.get_match_markets(match_id, language, max_seconds, category_id=cat_id)
             with lock:
                 for m in mkts:
-                    # Use market name as dedup key (no stable ID across categories)
                     key = m['name']
                     if key not in results:
                         results[key] = m
@@ -363,7 +372,7 @@ class BetclicClient:
             threads.append(t)
             t.start()
         for t in threads:
-            t.join(timeout=read_seconds + 5)
+            t.join(timeout=max_seconds + 5)
         return list(results.values())
 
     def close(self):
