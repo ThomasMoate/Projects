@@ -24,7 +24,11 @@ class WinamaxClient:
     SOCKET_URL = 'https://sports-eu-west-3.winamax.fr/uof-sports-server/socket.io/'
     MAIN_URL = 'https://www.winamax.fr'
 
-    def __init__(self):
+    def __init__(self, sport_id: int = 5):
+        """
+        sport_id : 1=Football, 2=Basketball, 3=Rugby, 5=Tennis (défaut)
+        """
+        self.sport_id = sport_id
         self.session = requests.Session()
         self.session.mount('https://', NoVerifyAdapter())
         self.session.headers.update({
@@ -53,7 +57,7 @@ class WinamaxClient:
 
         Retries up to 3 times with exponential backoff on failure.
         """
-        seed = seed_url or f'{self.MAIN_URL}/paris-sportifs/sports/5'
+        seed = seed_url or f'{self.MAIN_URL}/paris-sportifs/sports/{self.sport_id}'
         last_exc: Exception | None = None
         for attempt in range(3):
             try:

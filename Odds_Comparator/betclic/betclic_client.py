@@ -17,13 +17,35 @@ import requests
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Tennis category IDs — pass as category_id to get_match_markets()
+# Category IDs par sport — pass as category_id to get_match_markets()
 TENNIS_CATEGORIES: dict[str, str] = {
     'ca_ten_top':  'Le Top',
     'ca_ten_rslt': 'Résultats',
     'ca_ten_sts':  'Sets',
     'ca_ten_gms':  'Jeux',
     'ca_ten_ptss': 'Points & Service',
+}
+
+FOOTBALL_CATEGORIES: dict[str, str] = {
+    'ca_foo_top':  'Le Top',
+    'ca_foo_rslt': 'Résultats',
+    'ca_foo_buts': 'Buts',
+    'ca_foo_ah':   'Handicap asiatique',
+    'ca_foo_mi':   'Mi-Temps',
+}
+
+BASKETBALL_CATEGORIES: dict[str, str] = {
+    'ca_bsk_top':  'Le Top',
+    'ca_bsk_rslt': 'Résultats',
+    'ca_bsk_pts':  'Points',
+    'ca_bsk_mi':   'Mi-Temps',
+    'ca_bsk_qt':   'Quarts-Temps',
+}
+
+SPORT_CATEGORIES: dict[str, dict[str, str]] = {
+    'tennis':     TENNIS_CATEGORIES,
+    'football':   FOOTBALL_CATEGORIES,
+    'basketball': BASKETBALL_CATEGORIES,
 }
 
 GRPC_BASE = 'https://offering.begmedia.com/web/offering.access.api'
@@ -248,14 +270,15 @@ class BetclicClient:
                 frames.append(_decode_proto(payload))
         return frames
 
-    def get_tennis_matches(self, language: str = 'fr', limit: int = 100) -> list[dict]:
+    def get_matches(self, sport: str = 'tennis', language: str = 'fr', limit: int = 100) -> list[dict]:
         """
-        Fetch all pre-match + live tennis matches via GetMatchesBySportWithNotifications.
+        Fetch all pre-match + live matches for a given sport.
+        sport: 'tennis', 'football', 'basketball', ...
         Returns list of dicts: {match_id, title, start, is_live, competition_id,
                                  competition_name, open_market_count}.
         """
         proto_body = (
-            _encode_string(1, 'tennis') +
+            _encode_string(1, sport) +
             _encode_string(3, language) +
             _encode_int64(4, 0) +
             _encode_int64(5, limit)
@@ -289,6 +312,41 @@ class BetclicClient:
                     'open_market_count': m.get(7, 0),
                 })
         return matches
+
+    def get_tennis_matches(self, language: str = 'fr', limit: int = 100) -> list[dict]:
+        """Alias for backward compatibility."""
+        return self.get_matches('tennis', language, limit)
+
+    def get_all_match_markets_for_categories(
+        self,
+        match_id: int,
+        categories: dict[str, str],
+        language: str = 'fr',
+        max_seconds: float = 8.0,
+    ) -> list[dict]:
+        """
+        Fetch markets for all categories in parallel (generic, any sport).
+        categories: dict of {category_id: label}, e.g. FOOTBALL_CATEGORIES.
+        Returns deduplicated list of {name, selections} dicts.
+        """
+        results: dict[str, dict] = {}
+        threads = []
+        lock = threading.Lock()
+
+        def _fetch(cat_id: str):
+            mkts = self.get_match_markets(match_id, language, max_seconds, category_id=cat_id)
+            with lock:
+                for m in mkts:
+                    if m['name'] not in results:
+                        results[m['name']] = m
+
+        for cat in categories:
+            t = threading.Thread(target=_fetch, args=(cat,), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=max_seconds + 5)
+        return list(results.values())
 
     def get_match_markets(
         self,

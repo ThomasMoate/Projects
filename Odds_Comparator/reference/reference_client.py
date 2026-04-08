@@ -56,103 +56,125 @@ def _no_vig(odds_a: float, odds_b: float) -> tuple[float, float]:
     total = pa + pb
     return round(1 / (pa / total), 3), round(1 / (pb / total), 3)
 
+def _no_vig_three_way(h: float, d: float, a: float) -> tuple[float, float, float]:
+    """Fair odds sans marge pour un marché à trois issues (1X2 football)."""
+    ph, pd, pa = 1 / h, 1 / d, 1 / a
+    total = ph + pd + pa
+    return round(1 / (ph / total), 3), round(1 / (pd / total), 3), round(1 / (pa / total), 3)
+
 
 # ── Source Pinnacle (Basic Auth) ──────────────────────────────────────────────
 
 class _PinnacleSource:
-    BASE = 'https://api.pinnacle.com'
-    SPORT = 33
-
-    def __init__(self):
+    def __init__(self, sport: str = 'tennis'):
+        self.sport = sport
         from pinnacle_client import PinnacleClient
-        self._client = PinnacleClient()
+        self._client = PinnacleClient(sport=sport)
 
     def is_available(self) -> bool:
         return self._client.is_configured()
 
     def get_reference_odds(self) -> dict:
         """
-        Retourne {match_key: {market_key: {'over'/'under'/'p0'/'p1': fair_odds, 'source': 'pinnacle'}}}
+        Retourne {match_key: {market_key: {side: fair_odds, 'source': 'pinnacle'}}}
+        Gère tennis (2-way + specials), football (3-way 1X2 + total buts),
+        basketball (2-way + total points).
         """
         client = self._client
-        print('  [référence] Pinnacle — récupération…', file=sys.stderr)
-        league_ids = client.get_active_league_ids()[:30]
-        matches = [m for m in client.get_fixtures(league_ids) if not m['live']]
+        sport  = self.sport
+        print(f'  [référence] Pinnacle ({sport}) — récupération…', file=sys.stderr)
+
+        league_ids = client.get_active_league_ids()[:50]
+        matches    = [m for m in client.get_fixtures(league_ids) if not m['live']]
         if not matches:
             return {}
 
         active_lgids = list({m['leagueId'] for m in matches})
         match_by_id  = {m['id']: m for m in matches}
         odds_map     = client.get_odds(active_lgids)
-        specials     = client.get_all_specials(active_lgids)
 
         result: dict = {}
 
-        # ── Marchés principaux ──
         for eid, m in match_by_id.items():
             mk = _match_key(m['home'], m['away'])
             o  = odds_map.get(eid, {})
             ml = o.get('moneyline', {})
             result.setdefault(mk, {})
 
-            # Vainqueur
+            # ── Moneyline ───────────────────────────────────────────────────────
             if ml.get('home') and ml.get('away'):
-                fh, fa = _no_vig(ml['home'], ml['away'])
                 ln_home = _last_name(m['home'])
-                p0, p1  = sorted([_last_name(m['home']), _last_name(m['away'])])
+                ln_away = _last_name(m['away'])
+                p0, p1  = sorted([ln_home, ln_away])
                 side_h  = 'p0' if ln_home == p0 else 'p1'
                 side_a  = 'p1' if side_h == 'p0' else 'p0'
-                result[mk][('match_winner', None)] = {
-                    side_h: fh, side_a: fa, 'source': 'pinnacle'
-                }
 
-            # Total jeux
-            for t in o.get('totals', []):
-                if t['over'] and t['under']:
-                    fo, fu = _no_vig(t['over'], t['under'])
-                    result[mk][('total_games', t['line'])] = {
-                        'over': fo, 'under': fu, 'source': 'pinnacle'
+                if ml.get('draw') and sport == 'football':
+                    # 3-way 1X2 (football)
+                    fh, fd, fa = _no_vig_three_way(ml['home'], ml['draw'], ml['away'])
+                    result[mk][('match_winner_1x2', None)] = {
+                        side_h: fh, 'draw': fd, side_a: fa, 'source': 'pinnacle'
                     }
-
-        # ── Marchés spéciaux (aces, breaks, props) ──
-        for sp in specials:
-            parent_id = sp['parent_id']
-            m = match_by_id.get(parent_id)
-            if not m:
-                continue
-            mk  = _match_key(m['home'], m['away'])
-            nom = _norm(sp['name'])
-            ocs = sp['outcomes']
-            result.setdefault(mk, {})
-
-            # Trouver les deux côtés over/under
-            over_oc  = next((o for o in ocs if _is_over(o['name']) is True),  None)
-            under_oc = next((o for o in ocs if _is_over(o['name']) is False), None)
-            if not over_oc or not under_oc:
-                continue
-            fo, fu = _no_vig(over_oc['odds'], under_oc['odds'])
-            line   = _extract_line(over_oc['name']) or _extract_line(sp['name'])
-            if not line:
-                continue
-
-            if 'ace' in nom and re.search(r'total|match|both', nom):
-                result[mk][('total_aces', line)] = {'over': fo, 'under': fu, 'source': 'pinnacle'}
-            elif 'ace' in nom:
-                # Aces par joueur — extraire le nom depuis le titre du marché
-                player_ln = _extract_player_from_prop(sp['name'], m['home'], m['away'])
-                if player_ln:
-                    result[mk][('player_aces', line, player_ln)] = {
-                        'over': fo, 'under': fu, 'source': 'pinnacle'
-                    }
-            elif 'break' in nom:
-                if re.search(r'total|match|both', nom):
-                    result[mk][('total_breaks', line)] = {'over': fo, 'under': fu, 'source': 'pinnacle'}
                 else:
+                    # 2-way (tennis, basketball)
+                    fh, fa = _no_vig(ml['home'], ml['away'])
+                    result[mk][('match_winner', None)] = {
+                        side_h: fh, side_a: fa, 'source': 'pinnacle'
+                    }
+
+            # ── Totals (sport-specific market key) ───────────────────────────
+            total_key = {
+                'tennis':     'total_games',
+                'football':   'total_goals',
+                'basketball': 'total_points',
+            }.get(sport, 'total_games')
+
+            for t in o.get('totals', []):
+                if t.get('over') and t.get('under'):
+                    fo, fu = _no_vig(t['over'], t['under'])
+                    result[mk][(total_key, t['line'])] = {
+                        'over': fo, 'under': fu, 'source': 'pinnacle'
+                    }
+
+        # ── Marchés spéciaux (tennis uniquement : aces, breaks) ──────────────
+        if sport == 'tennis':
+            specials = client.get_all_specials(active_lgids)
+            for sp in specials:
+                parent_id = sp['parent_id']
+                m = match_by_id.get(parent_id)
+                if not m:
+                    continue
+                mk  = _match_key(m['home'], m['away'])
+                nom = _norm(sp['name'])
+                ocs = sp['outcomes']
+                result.setdefault(mk, {})
+
+                over_oc  = next((o for o in ocs if _is_over(o['name']) is True),  None)
+                under_oc = next((o for o in ocs if _is_over(o['name']) is False), None)
+                if not over_oc or not under_oc:
+                    continue
+                fo, fu = _no_vig(over_oc['odds'], under_oc['odds'])
+                line   = _extract_line(over_oc['name']) or _extract_line(sp['name'])
+                if not line:
+                    continue
+
+                if 'ace' in nom and re.search(r'total|match|both', nom):
+                    result[mk][('total_aces', line)] = {'over': fo, 'under': fu, 'source': 'pinnacle'}
+                elif 'ace' in nom:
                     player_ln = _extract_player_from_prop(sp['name'], m['home'], m['away'])
                     if player_ln:
-                        result[mk][('player_breaks', line, player_ln)] = {
+                        result[mk][('player_aces', line, player_ln)] = {
                             'over': fo, 'under': fu, 'source': 'pinnacle'
                         }
+                elif 'break' in nom:
+                    if re.search(r'total|match|both', nom):
+                        result[mk][('total_breaks', line)] = {'over': fo, 'under': fu, 'source': 'pinnacle'}
+                    else:
+                        player_ln = _extract_player_from_prop(sp['name'], m['home'], m['away'])
+                        if player_ln:
+                            result[mk][('player_breaks', line, player_ln)] = {
+                                'over': fo, 'under': fu, 'source': 'pinnacle'
+                            }
 
         return result
 
@@ -164,9 +186,18 @@ class _PinnacleSource:
 
 class _OddsApiSource:
     BASE = 'https://api.the-odds-api.com/v4'
-    SPORTS = ['tennis_atp', 'tennis_wta']
 
-    def __init__(self, cache_ttl: int = 300):
+    # Sports API keys per sport
+    SPORT_KEYS: dict[str, list[str]] = {
+        'tennis':     ['tennis_atp', 'tennis_wta'],
+        'football':   ['soccer_france_ligue1', 'soccer_spain_la_liga',
+                       'soccer_england_league1', 'soccer_germany_bundesliga',
+                       'soccer_italy_serie_a', 'soccer_uefa_champs_league'],
+        'basketball': ['basketball_nba', 'basketball_euroleague'],
+    }
+
+    def __init__(self, sport: str = 'tennis', cache_ttl: int = 300):
+        self.sport     = sport
         self.api_key   = os.environ.get('ODDS_API_KEY', '')
         self.cache_ttl = cache_ttl
         self._cache: dict = {}
@@ -201,8 +232,16 @@ class _OddsApiSource:
         return data
 
     def get_reference_odds(self) -> dict:
+        sport_list = self.SPORT_KEYS.get(self.sport, self.SPORT_KEYS['tennis'])
+        # For football totals, the market key changes
+        total_key  = {
+            'tennis':     'total_games',
+            'football':   'total_goals',
+            'basketball': 'total_points',
+        }.get(self.sport, 'total_games')
+
         result: dict = {}
-        for sport in self.SPORTS:
+        for sport in sport_list:
             try:
                 events = self._fetch(sport)
             except Exception as e:
@@ -227,6 +266,25 @@ class _OddsApiSource:
                             result[mk].setdefault(('match_winner', None), {
                                 sa: fa, sb: fb, 'source': bk['key']
                             })
+                        elif key == 'h2h' and len(ocs) == 3 and self.sport == 'football':
+                            # 3-way (football 1X2 with draw)
+                            odds_map = {o['name']: o['price'] for o in ocs}
+                            draw_name = next((n for n in odds_map if 'draw' in n.lower()), None)
+                            if draw_name:
+                                team_names = [n for n in odds_map if n != draw_name]
+                                if len(team_names) == 2:
+                                    sorted_t = sorted([_last_name(n) for n in team_names])
+                                    ln0 = _last_name(team_names[0])
+                                    sa  = 'p0' if ln0 == sorted_t[0] else 'p1'
+                                    sb  = 'p1' if sa == 'p0' else 'p0'
+                                    fh, fd, fa2 = _no_vig_three_way(
+                                        odds_map[team_names[0]],
+                                        odds_map[draw_name],
+                                        odds_map[team_names[1]],
+                                    )
+                                    result[mk].setdefault(('match_winner_1x2', None), {
+                                        sa: fh, 'draw': fd, sb: fa2, 'source': bk['key']
+                                    })
                         elif key == 'totals':
                             pairs: dict[float, dict] = {}
                             for o in ocs:
@@ -238,7 +296,7 @@ class _OddsApiSource:
                             for pt, sides in pairs.items():
                                 if 'over' in sides and 'under' in sides:
                                     fo, fu = _no_vig(sides['over'], sides['under'])
-                                    result[mk].setdefault(('total_games', pt), {
+                                    result[mk].setdefault((total_key, pt), {
                                         'over': fo, 'under': fu, 'source': bk['key']
                                     })
         return result
@@ -261,9 +319,10 @@ class ReferenceClient:
                 ref_odds = {}
     """
 
-    def __init__(self, source: str = 'auto', cache_ttl: int = 300):
+    def __init__(self, source: str = 'auto', sport: str = 'tennis', cache_ttl: int = 300):
         """
-        source : 'auto' | 'pinnacle' | 'oddsapi'
+        source    : 'auto' | 'pinnacle' | 'oddsapi'
+        sport     : 'tennis' | 'football' | 'basketball'
         cache_ttl : secondes entre deux appels API (Odds API seulement)
         """
         self._source: _PinnacleSource | _OddsApiSource | None = None
@@ -271,7 +330,7 @@ class ReferenceClient:
 
         if source in ('auto', 'pinnacle'):
             try:
-                ps = _PinnacleSource()
+                ps = _PinnacleSource(sport=sport)
                 if ps.is_available():
                     self._source = ps
                     self._source_name = 'pinnacle'
@@ -280,7 +339,7 @@ class ReferenceClient:
                 pass
 
         if source in ('auto', 'oddsapi'):
-            oa = _OddsApiSource(cache_ttl=cache_ttl)
+            oa = _OddsApiSource(sport=sport, cache_ttl=cache_ttl)
             if oa.is_available():
                 self._source = oa
                 self._source_name = 'oddsapi'
@@ -354,10 +413,11 @@ def _extract_player_from_prop(prop_name: str, home: str, away: str) -> str | Non
 def main():
     parser = argparse.ArgumentParser(description='Test source de référence odds')
     parser.add_argument('--source', choices=['auto', 'pinnacle', 'oddsapi'], default='auto')
+    parser.add_argument('--sport',  choices=['tennis', 'football', 'basketball'], default='tennis')
     parser.add_argument('--cache',  type=int, default=300)
     args = parser.parse_args()
 
-    with ReferenceClient(source=args.source, cache_ttl=args.cache) as ref:
+    with ReferenceClient(source=args.source, sport=args.sport, cache_ttl=args.cache) as ref:
         if not ref.is_available():
             print('Aucune source de référence configurée.')
             print()

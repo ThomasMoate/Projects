@@ -1,0 +1,155 @@
+"""
+Scrape basketball odds from Betclic France via gRPC-web.
+
+Marchés : Vainqueur, Total points, Handicap, Quarts-Temps.
+
+Usage:
+    python basketball_odds.py
+    python basketball_odds.py --all-categories
+    python basketball_odds.py --prematch-only
+    python basketball_odds.py --output bsk.json
+"""
+import argparse
+import json
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+from betclic_client import BetclicClient, BASKETBALL_CATEGORIES
+
+
+@dataclass
+class Outcome:
+    name: str
+    odds: float
+
+
+@dataclass
+class Market:
+    name: str
+    outcomes: list[Outcome] = field(default_factory=list)
+
+
+@dataclass
+class MatchOdds:
+    match_id: int
+    title: str
+    start: str
+    is_live: bool
+    competition_id: int
+    competition_name: str
+    open_market_count: int
+    markets: list[Market] = field(default_factory=list)
+
+
+def scrape_all_basketball(
+    client: BetclicClient,
+    prematch_only: bool = False,
+    max_seconds: float = 8.0,
+    all_categories: bool = False,
+    category_id: str | None = None,
+    delay: float = 0.0,
+) -> list[MatchOdds]:
+    print('Fetching basketball match list…', file=sys.stderr)
+    raw_matches = client.get_matches('basketball')
+    print(f'Found {len(raw_matches)} basketball matches.', file=sys.stderr)
+
+    results: list[MatchOdds] = []
+    for i, m in enumerate(raw_matches, 1):
+        if prematch_only and m['is_live']:
+            continue
+
+        match_id = m['match_id']
+        title    = m['title']
+        status   = 'LIVE' if m['is_live'] else 'PREMATCH'
+
+        print(
+            f'[{i}/{len(raw_matches)}] {title} ({status}, {m["open_market_count"]} markets)…',
+            file=sys.stderr
+        )
+
+        try:
+            if all_categories:
+                markets_raw = client.get_all_match_markets_for_categories(
+                    match_id, BASKETBALL_CATEGORIES, max_seconds=max_seconds
+                )
+            else:
+                markets_raw = client.get_match_markets(
+                    match_id, max_seconds=max_seconds, category_id=category_id
+                )
+        except Exception as e:
+            print(f'  ERROR: {e}', file=sys.stderr)
+            markets_raw = []
+
+        markets = [
+            Market(
+                name=mkt['name'],
+                outcomes=[Outcome(**oc) for oc in mkt['selections']],
+            )
+            for mkt in markets_raw
+        ]
+
+        results.append(MatchOdds(
+            match_id=match_id,
+            title=title,
+            start=m['start'],
+            is_live=m['is_live'],
+            competition_id=m['competition_id'],
+            competition_name=m['competition_name'],
+            open_market_count=m['open_market_count'],
+            markets=markets,
+        ))
+
+        if delay:
+            time.sleep(delay)
+
+    return results
+
+
+def print_summary(matches: list[MatchOdds]):
+    for m in matches:
+        print(f'\n{"="*70}')
+        print(f'  {m.title}  (id={m.match_id}, {"LIVE" if m.is_live else "PREMATCH"})')
+        print(f'  {m.competition_name} | markets={len(m.markets)}')
+        print(f'{"="*70}')
+        for mkt in m.markets:
+            print(f'    • {mkt.name}')
+            for oc in mkt.outcomes:
+                print(f'        {oc.name}: {oc.odds}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Scrape Betclic France basketball odds')
+    parser.add_argument('--output', '-o', help='Write results to JSON file')
+    parser.add_argument('--prematch-only', action='store_true', help='Skip live matches')
+    parser.add_argument('--max-seconds', type=float, default=8.0)
+    parser.add_argument('--delay', type=float, default=0.0)
+    parser.add_argument('--all-categories', action='store_true',
+                        help='Fetch all market categories in parallel')
+    parser.add_argument('--category', default=None,
+                        choices=list(BASKETBALL_CATEGORIES.keys()))
+    args = parser.parse_args()
+
+    with BetclicClient() as client:
+        matches = scrape_all_basketball(
+            client,
+            prematch_only=args.prematch_only,
+            max_seconds=args.max_seconds,
+            all_categories=args.all_categories,
+            category_id=args.category,
+            delay=args.delay,
+        )
+
+    print(f'\nScraped {len(matches)} matches total.', file=sys.stderr)
+
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            json.dump([asdict(m) for m in matches], f, ensure_ascii=False, indent=2)
+        print(f'Results written to {args.output}', file=sys.stderr)
+
+    print_summary(matches)
+
+
+if __name__ == '__main__':
+    main()

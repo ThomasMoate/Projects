@@ -28,10 +28,18 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE = 'https://api.pinnacle.com'
-TENNIS_SPORT_ID = 33
 
-# Principaux tournois ATP/WTA (IDs courants – complétés dynamiquement si nécessaire)
-# On récupère la liste complète via /v2/leagues
+# Sport IDs Pinnacle
+TENNIS_SPORT_ID     = 33
+FOOTBALL_SPORT_ID   = 29   # soccer
+BASKETBALL_SPORT_ID = 4
+
+SPORT_IDS: dict[str, int] = {
+    'tennis':     TENNIS_SPORT_ID,
+    'football':   FOOTBALL_SPORT_ID,
+    'basketball': BASKETBALL_SPORT_ID,
+}
+
 KNOWN_LEAGUE_IDS: list[int] = []
 
 
@@ -46,7 +54,17 @@ class PinnacleClient:
       - Specials/Props : aces par joueur, total aces, total breaks, etc.
     """
 
-    def __init__(self, username: str | None = None, password: str | None = None):
+    def __init__(
+        self,
+        sport: str = 'tennis',
+        username: str | None = None,
+        password: str | None = None,
+    ):
+        """
+        sport : 'tennis' | 'football' | 'basketball'
+        """
+        self.sport_id = SPORT_IDS.get(sport, TENNIS_SPORT_ID)
+        self.sport    = sport
         self.username = username or os.environ.get('PINNACLE_USER', '')
         self.password = password or os.environ.get('PINNACLE_PASS', '')
         self.session = requests.Session()
@@ -78,11 +96,11 @@ class PinnacleClient:
 
     # ── Leagues ──────────────────────────────────────────────────────────────
 
-    def get_tennis_leagues(self) -> list[dict]:
-        """Retourne tous les tournois tennis actifs."""
+    def get_leagues(self) -> list[dict]:
+        """Retourne tous les tournois/ligues actifs pour le sport configuré."""
         if self._league_cache is not None:
             return self._league_cache
-        data = self._get('/v2/leagues', sportId=TENNIS_SPORT_ID)
+        data = self._get('/v2/leagues', sportId=self.sport_id)
         leagues = [
             {'id': lg['id'], 'name': lg.get('name', ''), 'home_team_type': lg.get('homeTeamType', '')}
             for lg in data.get('leagues', [])
@@ -90,10 +108,13 @@ class PinnacleClient:
         self._league_cache = leagues
         return leagues
 
+    def get_tennis_leagues(self) -> list[dict]:
+        """Alias backward-compatible."""
+        return self.get_leagues()
+
     def get_active_league_ids(self) -> list[int]:
-        """IDs des tournois qui ont des matchs en ce moment."""
-        leagues = self.get_tennis_leagues()
-        return [lg['id'] for lg in leagues]
+        """IDs des ligues/tournois actifs pour le sport configuré."""
+        return [lg['id'] for lg in self.get_leagues()]
 
     # ── Fixtures (liste des matchs) ───────────────────────────────────────────
 
@@ -104,7 +125,7 @@ class PinnacleClient:
         """
         data = self._get(
             '/v1/fixtures',
-            sportId=TENNIS_SPORT_ID,
+            sportId=self.sport_id,
             leagueIds=','.join(map(str, league_ids)),
         )
         matches = []
@@ -129,7 +150,7 @@ class PinnacleClient:
         """
         data = self._get(
             '/v2/odds',
-            sportId=TENNIS_SPORT_ID,
+            sportId=self.sport_id,
             leagueIds=','.join(map(str, league_ids)),
             oddsFormat='Decimal',
         )
@@ -174,7 +195,7 @@ class PinnacleClient:
         """
         data = self._get(
             '/v2/fixtures/special',
-            sportId=TENNIS_SPORT_ID,
+            sportId=self.sport_id,
             leagueIds=','.join(map(str, league_ids)),
         )
         result: dict[int, dict] = {}
@@ -197,7 +218,7 @@ class PinnacleClient:
         """
         data = self._get(
             '/v2/odds/special',
-            sportId=TENNIS_SPORT_ID,
+            sportId=self.sport_id,
             leagueIds=','.join(map(str, league_ids)),
         )
         result: dict[int, dict] = {}

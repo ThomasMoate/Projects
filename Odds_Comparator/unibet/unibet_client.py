@@ -77,25 +77,32 @@ class UnibetClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_tennis_leagues(self):
-        """Return list of {id, name} for all active tennis leagues."""
+    def get_sport_leagues(self, sport_code: str) -> list[dict]:
+        """
+        Return list of {id, name, category} for all active leagues of a sport.
+        sport_code : 'TENN' (tennis), 'FOOT' (football), 'BASK' (basketball), etc.
+        """
         data = self._get(
             'lvs-api/ept',
             up=1, hidden=0, liveCount='e', preCount='e', status='OPEN,SUSPENDED'
         )
-        tennis = next((s for s in data.get('ept', []) if s.get('code') == 'TENN'), None)
-        if not tennis:
+        sport = next((s for s in data.get('ept', []) if s.get('code') == sport_code), None)
+        if not sport:
             return []
         leagues = []
-        for cat in tennis.get('path', []):
-            for league in cat.get('path', []):
-                if league.get('count', 0) > 0:
+        for cat in sport.get('path', []):
+            for item in cat.get('path', []):
+                if item.get('count', 0) > 0:
                     leagues.append({
-                        'id': league['id'],
-                        'name': league['desc'],
+                        'id': item['id'],
+                        'name': item['desc'],
                         'category': cat['desc'],
                     })
         return leagues
+
+    def get_tennis_leagues(self):
+        """Return active tennis leagues (backward-compatible alias)."""
+        return self.get_sport_leagues('TENN')
 
     def get_events_for_league(self, league_id, limit=50):
         """Return list of event IDs (strings like 'e3336406') for a league."""

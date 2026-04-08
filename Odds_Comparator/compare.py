@@ -2,29 +2,16 @@
 """
 compare.py — Détecte les cotes surévaluées sur Winamax, Betclic, Unibet.
 
-Principe :
-  1. Charge les JSON de chaque bookmaker (ou les génère avec --fetch)
-  2. Normalise les matchs et marchés pour les aligner entre bookmakers
-  3. Calcule la probabilité "juste" (sans marge) = moyenne des proba no-vig
-  4. Affiche les cotes supérieures à la cote juste (= value bets)
+Sports supportés : tennis (défaut), football, basketball
 
 Usage :
-    # Récupération unique (tous les bookmakers en parallèle, sans stockage fichier)
-    python compare.py --fetch
-
-    # Mode temps réel : rafraîchit toutes les 60s (Ctrl+C pour quitter)
-    python compare.py --watch
-
-    # Mode temps réel avec intervalle personnalisé (ex: 120s)
-    python compare.py --watch 120
-
-    # Seuil minimum d'edge (défaut 3%)
-    python compare.py --fetch --min-edge 5.0
-
-    # Consensus basé sur au moins 3 bookmakers
-    python compare.py --watch --min-books 3
-
-    # Depuis des fichiers JSON existants
+    python compare.py --fetch                        # tennis, une fois
+    python compare.py --fetch --sport football       # football
+    python compare.py --fetch --sport basketball     # basket
+    python compare.py --watch                        # tennis, temps réel (60s)
+    python compare.py --watch 30 --sport football    # foot, refresh 30s
+    python compare.py --fetch --min-edge 5.0         # seuil 5%
+    python compare.py --fetch --no-reference         # sans Pinnacle
     python compare.py --winamax w.json --betclic b.json --unibet u.json
 """
 import re
@@ -336,6 +323,207 @@ def parse_unibet(data: list[dict]) -> dict:
     return result
 
 
+# ── Parsing Football ─────────────────────────────────────────────────────────
+
+def _is_draw_label(label: str) -> bool:
+    n = norm(label)
+    return 'nul' in n or 'draw' in n or n in ('x', 'n', 'egalite', 'tie', 'match nul')
+
+def parse_winamax_football(data: list[dict]) -> dict:
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for m in data:
+        mk = match_key(m['title'])
+        sp = mk
+        for bet in m.get('bets', []):
+            name      = bet['name']
+            norm_name = norm(name)
+            outcomes  = bet.get('outcomes', [])
+
+            # ── 1X2 ──
+            if norm_name in ('résultat', '1x2', 'resultat du match', '1 x 2') \
+               or (norm_name == 'résultat' and bet.get('category') == 'Match'):
+                for o in outcomes:
+                    if _is_draw_label(o['label']):
+                        side = 'draw'
+                    else:
+                        side = _wm_player_side(o['label'], sp)
+                    result[mk][('match_winner_1x2', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
+
+            # ── Total buts ──
+            elif re.search(r'nombre de buts|total buts|buts dans le match', norm_name):
+                for o in outcomes:
+                    line = extract_line(o['label'])
+                    over = is_over(o['label'])
+                    if line and over is not None:
+                        result[mk][('total_goals', line)]['over' if over else 'under'].append(
+                            Offer('winamax', o['odd'], o['label']))
+
+    return result
+
+
+def parse_betclic_football(data: list[dict]) -> dict:
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for m in data:
+        mk = match_key(m['title'])
+        sp = mk
+        for mkt in m.get('markets', []):
+            name      = mkt['name']
+            norm_name = norm(name)
+            outcomes  = mkt.get('outcomes', [])
+
+            # ── 1X2 ──
+            if norm_name in ('résultat du match', 'résultat', '1x2'):
+                for o in outcomes:
+                    if _is_draw_label(o['name']):
+                        side = 'draw'
+                    else:
+                        side = _wm_player_side(o['name'], sp)
+                    result[mk][('match_winner_1x2', None)][side].append(
+                        Offer('betclic', o['odds'], o['name']))
+
+            # ── Total buts ──
+            elif re.search(r'nombre total de buts|total buts|buts', norm_name):
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        result[mk][('total_goals', line)]['over' if over else 'under'].append(
+                            Offer('betclic', o['odds'], o['name']))
+
+    return result
+
+
+def parse_unibet_football(data: list[dict]) -> dict:
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for m in data:
+        mk = match_key(m['title'])
+        sp = mk
+        for mkt in m.get('markets', []):
+            name      = mkt['name']
+            norm_name = norm(name)
+            cat       = norm(mkt.get('category', ''))
+            outcomes  = mkt.get('outcomes', [])
+
+            # ── 1X2 : détection par nom ou par présence d'un résultat nul ──
+            is_1x2 = (
+                cat == 'résultat' or
+                norm_name in ('résultat', 'résultat du match', '1x2') or
+                any(_is_draw_label(o.get('label', '')) for o in outcomes) and len(outcomes) == 3
+            )
+            if is_1x2:
+                for o in outcomes:
+                    if _is_draw_label(o.get('label', '')):
+                        side = 'draw'
+                    else:
+                        side = _wm_player_side(o.get('label', ''), sp)
+                    result[mk][('match_winner_1x2', None)][side].append(
+                        Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── Total buts ──
+            elif cat == 'buts' or re.search(r'but', norm_name):
+                line = extract_line(name)
+                if line:
+                    for o in outcomes:
+                        over = is_over(o.get('label', ''))
+                        if over is not None:
+                            result[mk][('total_goals', line)]['over' if over else 'under'].append(
+                                Offer('unibet', o['odd'], o.get('label', '')))
+
+    return result
+
+
+# ── Parsing Basketball ────────────────────────────────────────────────────────
+
+def parse_winamax_basketball(data: list[dict]) -> dict:
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for m in data:
+        mk = match_key(m['title'])
+        sp = mk
+        for bet in m.get('bets', []):
+            name      = bet['name']
+            norm_name = norm(name)
+            outcomes  = bet.get('outcomes', [])
+
+            # ── Vainqueur 2-way ──
+            if norm_name == 'vainqueur' and len(outcomes) == 2:
+                for o in outcomes:
+                    side = _wm_player_side(o['label'], sp)
+                    result[mk][('match_winner', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
+
+            # ── Total points ──
+            elif re.search(r'nombre de points|total points|points dans le match', norm_name):
+                for o in outcomes:
+                    line = extract_line(o['label'])
+                    over = is_over(o['label'])
+                    if line and over is not None:
+                        result[mk][('total_points', line)]['over' if over else 'under'].append(
+                            Offer('winamax', o['odd'], o['label']))
+
+    return result
+
+
+def parse_betclic_basketball(data: list[dict]) -> dict:
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for m in data:
+        mk = match_key(m['title'])
+        sp = mk
+        for mkt in m.get('markets', []):
+            name      = mkt['name']
+            norm_name = norm(name)
+            outcomes  = mkt.get('outcomes', [])
+
+            # ── Vainqueur 2-way ──
+            if norm_name in ('vainqueur du match', 'vainqueur') and len(outcomes) == 2:
+                for o in outcomes:
+                    side = _wm_player_side(o['name'], sp)
+                    result[mk][('match_winner', None)][side].append(
+                        Offer('betclic', o['odds'], o['name']))
+
+            # ── Total points ──
+            elif re.search(r'total points|nombre total de points|points', norm_name):
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        result[mk][('total_points', line)]['over' if over else 'under'].append(
+                            Offer('betclic', o['odds'], o['name']))
+
+    return result
+
+
+def parse_unibet_basketball(data: list[dict]) -> dict:
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for m in data:
+        mk = match_key(m['title'])
+        sp = mk
+        for mkt in m.get('markets', []):
+            name      = mkt['name']
+            norm_name = norm(name)
+            cat       = norm(mkt.get('category', ''))
+            outcomes  = mkt.get('outcomes', [])
+
+            # ── Vainqueur 2-way ──
+            if cat == 'résultat' and len(outcomes) == 2:
+                for o in outcomes:
+                    side = _wm_player_side(o.get('label', ''), sp)
+                    result[mk][('match_winner', None)][side].append(
+                        Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── Total points ──
+            elif cat == 'points' or re.search(r'point', norm_name):
+                line = extract_line(name)
+                if line:
+                    for o in outcomes:
+                        over = is_over(o.get('label', ''))
+                        if over is not None:
+                            result[mk][('total_points', line)]['over' if over else 'under'].append(
+                                Offer('unibet', o['odd'], o.get('label', '')))
+
+    return result
+
+
 # ── Fusion et calcul de value ────────────────────────────────────────────────
 
 @dataclass
@@ -352,24 +540,32 @@ class ValueBet:
     ref_source: str = 'consensus'  # 'pinnacle' | 'oddsapi' | 'consensus'
 
 def no_vig_prob(odds_a: float, odds_b: float) -> tuple[float, float]:
-    """Retourne (prob_no_vig_A, prob_no_vig_B) sans marge."""
+    """Retourne (prob_no_vig_A, prob_no_vig_B) sans marge (marché 2 issues)."""
     p_a, p_b = 1 / odds_a, 1 / odds_b
     total = p_a + p_b
     return p_a / total, p_b / total
 
+def no_vig_three_way(h: float, d: float, a: float) -> tuple[float, float, float]:
+    """Retourne (fair_h, fair_d, fair_a) sans marge (marché 1X2 à 3 issues)."""
+    ph, pd, pa = 1 / h, 1 / d, 1 / a
+    total = ph + pd + pa
+    return ph / total, pd / total, pa / total  # probabilities (not odds)
+
 def _market_label(key) -> str:
     market = key[0]
     labels = {
-        'match_winner': 'Vainqueur',
-        'total_games':  'Total jeux',
-        'total_aces':   'Total aces',
-        'total_breaks': 'Total breaks',
-        'player_aces':  'Aces joueur',
-        'player_breaks':'Breaks joueur',
+        'match_winner':      'Vainqueur',
+        'match_winner_1x2':  '1X2',
+        'total_games':       'Total jeux',
+        'total_goals':       'Total buts',
+        'total_points':      'Total points',
+        'total_aces':        'Total aces',
+        'total_breaks':      'Total breaks',
+        'player_aces':       'Aces joueur',
+        'player_breaks':     'Breaks joueur',
     }
     base = labels.get(market, market)
-    if len(key) == 3 and key[2] not in ('over','under','p0','p1'):
-        # player prop
+    if len(key) == 3 and key[2] not in ('over', 'under', 'p0', 'p1', 'home', 'away', 'draw'):
         return f'{base} ({key[2]})'
     return base
 
@@ -408,14 +604,8 @@ def compute_value_bets(
                     merged[group_key][side].extend(offers)
 
         for group_key, sides in merged.items():
-            if group_key[0] == 'match_winner':
-                side_pair = ('p0', 'p1')
-            else:
-                side_pair = ('over', 'under')
-
-            s_a, s_b = side_pair
-            if s_a not in sides or s_b not in sides:
-                continue
+            THREE_WAY = group_key[0] == 'match_winner_1x2'
+            line = group_key[1] if len(group_key) > 1 else None
 
             def best_by_bk(offers: list[Offer]) -> dict[str, float]:
                 d: dict[str, float] = {}
@@ -424,69 +614,140 @@ def compute_value_bets(
                         d[o.bookmaker] = o.odds
                 return d
 
-            bk_a = best_by_bk(sides[s_a])
-            bk_b = best_by_bk(sides[s_b])
+            if THREE_WAY:
+                # ── Marché 3-way (1X2 football) ──────────────────────────────
+                if not all(s in sides for s in ('p0', 'p1', 'draw')):
+                    continue
+                bk_h  = best_by_bk(sides['p0'])
+                bk_d  = best_by_bk(sides['draw'])
+                bk_a2 = best_by_bk(sides['p1'])
 
-            # ── Référence Pinnacle / Odds API (no-vig) ───────────────────────
-            ref_fair_a: float | None = None
-            ref_fair_b: float | None = None
-            ref_src = ''
-            if ref_odds:
-                ref_match = ref_odds.get(mk)
-                if ref_match:
-                    ref_mkt = ref_match.get(group_key)
-                    if ref_mkt:
-                        ref_fair_a = ref_mkt.get(s_a)
-                        ref_fair_b = ref_mkt.get(s_b)
-                        ref_src = ref_mkt.get('source', 'pinnacle')
+                # Référence (Pinnacle)
+                ref_h = ref_d = ref_a2 = None
+                ref_src = ''
+                if ref_odds:
+                    rm = ref_odds.get(mk, {}).get(group_key)
+                    if rm:
+                        ref_h, ref_d, ref_a2 = rm.get('p0'), rm.get('draw'), rm.get('p1')
+                        ref_src = rm.get('source', 'pinnacle')
 
-            # ── Consensus soft books ─────────────────────────────────────────
-            fair_a_cons: float | None = None
-            fair_b_cons: float | None = None
-            common = set(bk_a) & set(bk_b)
-            if len(common) >= min_books:
-                probs_a, probs_b = [], []
-                for bk in common:
-                    pa, pb = no_vig_prob(bk_a[bk], bk_b[bk])
-                    probs_a.append(pa)
-                    probs_b.append(pb)
-                ca = sum(probs_a) / len(probs_a)
-                cb = sum(probs_b) / len(probs_b)
-                fair_a_cons = 1 / ca if ca > 0 else 9999
-                fair_b_cons = 1 / cb if cb > 0 else 9999
+                # Consensus
+                common3 = set(bk_h) & set(bk_d) & set(bk_a2)
+                fair_h_c = fair_d_c = fair_a2_c = None
+                if len(common3) >= min_books:
+                    ph_l, pd_l, pa_l = [], [], []
+                    for bk in common3:
+                        ph, pd, pa = no_vig_three_way(bk_h[bk], bk_d[bk], bk_a2[bk])
+                        ph_l.append(ph); pd_l.append(pd); pa_l.append(pa)
+                    def _avg_fair(pl): return 1 / (sum(pl) / len(pl))
+                    fair_h_c  = _avg_fair(ph_l)
+                    fair_d_c  = _avg_fair(pd_l)
+                    fair_a2_c = _avg_fair(pa_l)
 
-            # ── Choisir la meilleure référence ───────────────────────────────
-            if ref_fair_a is not None and ref_fair_b is not None:
-                fair_a, fair_b = ref_fair_a, ref_fair_b
-                fair_source = ref_src
-            elif fair_a_cons is not None:
-                fair_a, fair_b = fair_a_cons, fair_b_cons
-                fair_source = 'consensus'
+                if ref_h and ref_d and ref_a2:
+                    fair_h, fair_d, fair_a2 = ref_h, ref_d, ref_a2
+                    fair_source = ref_src
+                elif fair_h_c:
+                    fair_h, fair_d, fair_a2 = fair_h_c, fair_d_c, fair_a2_c
+                    fair_source = 'consensus'
+                else:
+                    continue
+
+                for side, all_bk, fair_odds in [
+                    ('p0',  bk_h,  fair_h),
+                    ('draw',bk_d,  fair_d),
+                    ('p1',  bk_a2, fair_a2),
+                ]:
+                    for bk, odds in all_bk.items():
+                        edge = (odds / fair_odds - 1) * 100
+                        if edge >= min_edge:
+                            side_lbl = 'Nul' if side == 'draw' else _side_label(side, mk)
+                            value_bets.append(ValueBet(
+                                match=' vs '.join(p.capitalize() for p in mk),
+                                market=_market_label(group_key),
+                                line=None,
+                                side=side_lbl,
+                                bookmaker=bk,
+                                odds=odds,
+                                fair_odds=round(fair_odds, 3),
+                                edge_pct=round(edge, 1),
+                                all_odds={**{f'{k}(H)': v for k, v in bk_h.items()},
+                                          **{f'{k}(D)': v for k, v in bk_d.items()},
+                                          **{f'{k}(A)': v for k, v in bk_a2.items()}},
+                                ref_source=fair_source,
+                            ))
+
             else:
-                continue
+                # ── Marché 2-way (tennis, basket, over/under) ─────────────────
+                if group_key[0] == 'match_winner':
+                    side_pair = ('p0', 'p1')
+                else:
+                    side_pair = ('over', 'under')
 
-            line = group_key[1] if len(group_key) > 1 else None
+                s_a, s_b = side_pair
+                if s_a not in sides or s_b not in sides:
+                    continue
 
-            for (side, all_bk, fair_odds) in [
-                (s_a, bk_a, fair_a),
-                (s_b, bk_b, fair_b),
-            ]:
-                for bk, odds in all_bk.items():
-                    edge = (odds / fair_odds - 1) * 100
-                    if edge >= min_edge:
-                        value_bets.append(ValueBet(
-                            match=' vs '.join(p.capitalize() for p in mk),
-                            market=_market_label(group_key),
-                            line=line,
-                            side=_side_label(side, mk),
-                            bookmaker=bk,
-                            odds=odds,
-                            fair_odds=round(fair_odds, 3),
-                            edge_pct=round(edge, 1),
-                            all_odds={**{f'{k}(A)': v for k, v in bk_a.items()},
-                                      **{f'{k}(B)': v for k, v in bk_b.items()}},
-                            ref_source=fair_source,
-                        ))
+                bk_a = best_by_bk(sides[s_a])
+                bk_b = best_by_bk(sides[s_b])
+
+                # Référence Pinnacle
+                ref_fair_a: float | None = None
+                ref_fair_b: float | None = None
+                ref_src = ''
+                if ref_odds:
+                    ref_match = ref_odds.get(mk)
+                    if ref_match:
+                        ref_mkt = ref_match.get(group_key)
+                        if ref_mkt:
+                            ref_fair_a = ref_mkt.get(s_a)
+                            ref_fair_b = ref_mkt.get(s_b)
+                            ref_src = ref_mkt.get('source', 'pinnacle')
+
+                # Consensus soft books
+                fair_a_cons: float | None = None
+                fair_b_cons: float | None = None
+                common = set(bk_a) & set(bk_b)
+                if len(common) >= min_books:
+                    probs_a, probs_b = [], []
+                    for bk in common:
+                        pa, pb = no_vig_prob(bk_a[bk], bk_b[bk])
+                        probs_a.append(pa)
+                        probs_b.append(pb)
+                    ca = sum(probs_a) / len(probs_a)
+                    cb = sum(probs_b) / len(probs_b)
+                    fair_a_cons = 1 / ca if ca > 0 else 9999
+                    fair_b_cons = 1 / cb if cb > 0 else 9999
+
+                if ref_fair_a is not None and ref_fair_b is not None:
+                    fair_a, fair_b = ref_fair_a, ref_fair_b
+                    fair_source = ref_src
+                elif fair_a_cons is not None:
+                    fair_a, fair_b = fair_a_cons, fair_b_cons
+                    fair_source = 'consensus'
+                else:
+                    continue
+
+                for (side, all_bk, fair_odds) in [
+                    (s_a, bk_a, fair_a),
+                    (s_b, bk_b, fair_b),
+                ]:
+                    for bk, odds in all_bk.items():
+                        edge = (odds / fair_odds - 1) * 100
+                        if edge >= min_edge:
+                            value_bets.append(ValueBet(
+                                match=' vs '.join(p.capitalize() for p in mk),
+                                market=_market_label(group_key),
+                                line=line,
+                                side=_side_label(side, mk),
+                                bookmaker=bk,
+                                odds=odds,
+                                fair_odds=round(fair_odds, 3),
+                                edge_pct=round(edge, 1),
+                                all_odds={**{f'{k}(A)': v for k, v in bk_a.items()},
+                                          **{f'{k}(B)': v for k, v in bk_b.items()}},
+                                ref_source=fair_source,
+                            ))
 
     return sorted(value_bets, key=lambda v: -v.edge_pct)
 
@@ -513,22 +774,44 @@ def _load_scraper(subdir: str):
 def fetch_all_odds(
     prematch_only: bool = True,
     with_reference: bool = True,
+    sport: str = 'tennis',
 ) -> tuple[list, list, list, dict]:
     """Fetch odds from all 3 bookmakers + reference source in parallel threads.
 
     Returns (winamax_raw, betclic_raw, unibet_raw, ref_odds).
-    ref_odds is {} when no reference source is configured.
+    sport : 'tennis' | 'football' | 'basketball'
     """
     import dataclasses
     import threading as _th
 
     results: dict = {'winamax': [], 'betclic': [], 'unibet': [], 'reference': {}}
 
+    # ── Winamax ──────────────────────────────────────────────────────────────
+    _WM_SPORT_ID  = {'tennis': 5, 'football': 1, 'basketball': 2}
+    _WM_SCRAPE_FN = {
+        'tennis':     ('winamax', 'scrape_all_tennis_odds',    {}),
+        'football':   ('winamax', 'scrape_all_football_odds',  {}),
+        'basketball': ('winamax', 'scrape_all_basketball_odds',{}),
+    }
+    _BC_SCRAPE_FN = {
+        'tennis':     ('betclic', 'scrape_all_tennis',   {'all_categories': True}),
+        'football':   ('betclic', 'scrape_all_football', {'all_categories': True}),
+        'basketball': ('betclic', 'scrape_all_basketball',{'all_categories': True}),
+    }
+    _UB_SCRAPE_FN = {
+        'tennis':     ('unibet', 'scrape_tennis_odds',    {}),
+        'football':   ('unibet', 'scrape_football_odds',  {}),
+        'basketball': ('unibet', 'scrape_basketball_odds',{}),
+    }
+
     def _run_winamax():
         try:
-            mod = _load_scraper('winamax')
-            with mod.WinamaxClient() as c:
-                matches = mod.scrape_all_tennis_odds(c, prematch_only=prematch_only)
+            subdir, fn_name, extra = _WM_SCRAPE_FN[sport]
+            mod = _load_scraper(subdir)
+            sport_id = _WM_SPORT_ID.get(sport, 5)
+            with mod.WinamaxClient(sport_id=sport_id) as c:
+                fn = getattr(mod, fn_name)
+                matches = fn(c, prematch_only=prematch_only, **extra)
             results['winamax'] = [dataclasses.asdict(m) for m in matches]
             print(f'  winamax : {len(matches)} matchs', flush=True)
         except Exception as e:
@@ -536,11 +819,11 @@ def fetch_all_odds(
 
     def _run_betclic():
         try:
-            mod = _load_scraper('betclic')
+            subdir, fn_name, extra = _BC_SCRAPE_FN[sport]
+            mod = _load_scraper(subdir)
             with mod.BetclicClient() as c:
-                matches = mod.scrape_all_tennis(
-                    c, prematch_only=prematch_only, all_categories=True
-                )
+                fn = getattr(mod, fn_name)
+                matches = fn(c, prematch_only=prematch_only, **extra)
             results['betclic'] = [dataclasses.asdict(m) for m in matches]
             print(f'  betclic : {len(matches)} matchs', flush=True)
         except Exception as e:
@@ -548,9 +831,11 @@ def fetch_all_odds(
 
     def _run_unibet():
         try:
-            mod = _load_scraper('unibet')
+            subdir, fn_name, extra = _UB_SCRAPE_FN[sport]
+            mod = _load_scraper(subdir)
             with mod.UnibetClient() as c:
-                matches = mod.scrape_tennis_odds(c, prematch_only=prematch_only)
+                fn = getattr(mod, fn_name)
+                matches = fn(c, prematch_only=prematch_only, **extra)
             results['unibet'] = [dataclasses.asdict(m) for m in matches]
             print(f'  unibet  : {len(matches)} matchs', flush=True)
         except Exception as e:
@@ -564,7 +849,7 @@ def fetch_all_odds(
             if ref_path not in sys.path:
                 sys.path.insert(0, ref_path)
             from reference_client import ReferenceClient
-            with ReferenceClient() as ref:
+            with ReferenceClient(sport=sport) as ref:
                 if ref.is_available():
                     results['reference'] = ref.get_reference_odds()
                     print(
@@ -625,6 +910,9 @@ def main():
     parser.add_argument('--winamax', help='JSON Winamax (lecture depuis fichier)')
     parser.add_argument('--betclic', help='JSON Betclic (lecture depuis fichier)')
     parser.add_argument('--unibet',  help='JSON Unibet  (lecture depuis fichier)')
+    parser.add_argument('--sport',   default='tennis',
+                        choices=['tennis', 'football', 'basketball'],
+                        help='Sport à comparer (défaut: tennis)')
     parser.add_argument('--fetch',   action='store_true',
                         help='Récupère les cotes une fois (tous les bookmakers en parallèle)')
     parser.add_argument('--watch',   type=int, metavar='SECONDES', nargs='?', const=60,
@@ -657,12 +945,18 @@ def main():
                 print(f'[{ts}] Récupération des cotes en parallèle…', flush=True)
 
                 wm_raw, bc_raw, ub_raw, ref_odds = fetch_all_odds(
-                    prematch_only=True, with_reference=with_ref
+                    prematch_only=True, with_reference=with_ref, sport=args.sport
                 )
 
-                wm = parse_winamax(wm_raw)
-                bc = parse_betclic(bc_raw)
-                ub = parse_unibet(ub_raw)
+                _parse_wm, _parse_bc, _parse_ub = {
+                    'tennis':     (parse_winamax,            parse_betclic,            parse_unibet),
+                    'football':   (parse_winamax_football,   parse_betclic_football,   parse_unibet_football),
+                    'basketball': (parse_winamax_basketball, parse_betclic_basketball, parse_unibet_basketball),
+                }[args.sport]
+
+                wm = _parse_wm(wm_raw)
+                bc = _parse_bc(bc_raw)
+                ub = _parse_ub(ub_raw)
 
                 value_bets = compute_value_bets(
                     [wm, bc, ub], ref_odds, args.min_edge, args.min_books
@@ -700,9 +994,15 @@ def main():
                 print(f'  {name}: erreur — {e}', file=sys.stderr)
                 return {}
 
-        wm = load(args.winamax, parse_winamax, 'Winamax')
-        bc = load(args.betclic, parse_betclic, 'Betclic')
-        ub = load(args.unibet,  parse_unibet,  'Unibet')
+        _parse_wm, _parse_bc, _parse_ub = {
+            'tennis':     (parse_winamax,            parse_betclic,            parse_unibet),
+            'football':   (parse_winamax_football,   parse_betclic_football,   parse_unibet_football),
+            'basketball': (parse_winamax_basketball, parse_betclic_basketball, parse_unibet_basketball),
+        }[args.sport]
+
+        wm = load(args.winamax, _parse_wm, 'Winamax')
+        bc = load(args.betclic, _parse_bc, 'Betclic')
+        ub = load(args.unibet,  _parse_ub, 'Unibet')
 
         value_bets = compute_value_bets([wm, bc, ub], None, args.min_edge, args.min_books)
         print_results(value_bets, args.min_edge)
