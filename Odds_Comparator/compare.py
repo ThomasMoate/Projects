@@ -883,6 +883,36 @@ def _side_label(side: str, match_players: tuple[str, str]) -> str:
         return match_players[1].capitalize()
     return side
 
+
+def _best_by_bk(offers: list) -> dict:
+    """Meilleure cote par bookmaker depuis une liste d'Offer."""
+    d: dict = {}
+    for o in offers:
+        if o.bookmaker not in d or o.odds > d[o.bookmaker]:
+            d[o.bookmaker] = o.odds
+    return d
+
+
+def _consensus_1x2_probs(sides: dict, min_books: int) -> tuple | None:
+    """
+    Calcule (ph, pd, pa) moyennes no-vig depuis le marché 1X2.
+    Retourne None si pas assez de bookmakers communs.
+    """
+    if not all(s in sides for s in ('p0', 'draw', 'p1')):
+        return None
+    bk_h = _best_by_bk(sides['p0'])
+    bk_d = _best_by_bk(sides['draw'])
+    bk_a = _best_by_bk(sides['p1'])
+    common = set(bk_h) & set(bk_d) & set(bk_a)
+    if len(common) < min_books:
+        return None
+    ph_l, pd_l, pa_l = [], [], []
+    for bk in common:
+        ph, pd, pa = no_vig_three_way(bk_h[bk], bk_d[bk], bk_a[bk])
+        ph_l.append(ph); pd_l.append(pd); pa_l.append(pa)
+    n = len(ph_l)
+    return sum(ph_l)/n, sum(pd_l)/n, sum(pa_l)/n
+
 def compute_value_bets(
     all_books: list[dict],
     ref_odds: dict | None = None,
@@ -910,28 +940,49 @@ def compute_value_bets(
                 for side, offers in sides.items():
                     merged[group_key][side].extend(offers)
 
+        # ── Référence croisée : probs no-vig depuis le 1X2 ───────────────────
+        # Sert de référence pour DNB (1X2→DNB) et Double chance (1X2→DC).
+        _1x2_probs: tuple | None = None
+        _1x2_sides = merged.get(('match_winner_1x2', None))
+        if _1x2_sides:
+            _1x2_probs = _consensus_1x2_probs(dict(_1x2_sides), min_books)
+
         for group_key, sides in merged.items():
             THREE_WAY = group_key[0] in ('match_winner_1x2', 'half_time_1x2')
             DC        = group_key[0] == 'double_chance'
+            DNB       = group_key[0] == 'draw_no_bet'
             line = group_key[1] if len(group_key) > 1 else None
 
-            def best_by_bk(offers: list[Offer]) -> dict[str, float]:
-                d: dict[str, float] = {}
-                for o in offers:
-                    if o.bookmaker not in d or o.odds > d[o.bookmaker]:
-                        d[o.bookmaker] = o.odds
-                return d
-
             if DC:
-                # ── Double chance : 3 côtés indépendants, consensus simple ──────
+                # ── Double chance : référence préférée = 1X2 dérivé ──────────
                 _dc_labels = {'p0_draw': '1X', 'draw_p1': 'X2', 'p0_p1': '12'}
+
+                dc_1x2_fair: dict | None = None
+                if _1x2_probs:
+                    ph, pd, pa = _1x2_probs
+                    dc_1x2_fair = {
+                        'p0_draw': 1 / (ph + pd),
+                        'draw_p1': 1 / (pd + pa),
+                        'p0_p1':   1 / (ph + pa),
+                    }
+
                 for dc_side, dc_lbl in _dc_labels.items():
-                    bk_dc = best_by_bk(sides.get(dc_side, []))
-                    if len(bk_dc) < min_books:
+                    bk_dc = _best_by_bk(sides.get(dc_side, []))
+                    if not bk_dc:
                         continue
-                    probs = [1 / o for o in bk_dc.values()]
-                    avg_p = sum(probs) / len(probs)
-                    fair = 1 / avg_p
+
+                    fair: float | None = None
+                    fair_src = 'consensus'
+                    if dc_1x2_fair:
+                        fair = dc_1x2_fair[dc_side]
+                        fair_src = 'consensus (1X2→DC)'
+                    elif len(bk_dc) >= min_books:
+                        probs = [1 / o for o in bk_dc.values()]
+                        fair = 1 / (sum(probs) / len(probs))
+
+                    if fair is None:
+                        continue
+
                     for bk, odds in bk_dc.items():
                         edge = (odds / fair - 1) * 100
                         if edge >= min_edge:
@@ -945,17 +996,79 @@ def compute_value_bets(
                                 fair_odds=round(fair, 3),
                                 edge_pct=round(edge, 1),
                                 all_odds={k: v for k, v in bk_dc.items()},
-                                ref_source='consensus',
+                                ref_source=fair_src,
                             ))
                 continue  # DC handled, no arb possible
+
+            elif DNB:
+                # ── Draw No Bet : dérivé du 1X2 si disponible ─────────────────
+                # La cote juste du DNB est directement calculable depuis la
+                # probabilité no-vig du 1X2 : fair_H = 1 / (ph/(ph+pa)).
+                # Cela permet de comparer une cote DNB contre une référence
+                # même quand le book ne propose pas lui-même le 1X2 complet.
+                dnb_1x2_fair: dict | None = None
+                if _1x2_probs:
+                    ph, pd, pa = _1x2_probs
+                    denom = ph + pa
+                    if denom > 0:
+                        dnb_1x2_fair = {
+                            'p0': 1 / (ph / denom),
+                            'p1': 1 / (pa / denom),
+                        }
+
+                for dnb_side in ('p0', 'p1'):
+                    if dnb_side not in sides:
+                        continue
+                    bk_side = _best_by_bk(sides[dnb_side])
+                    if not bk_side:
+                        continue
+
+                    fair_val: float | None = None
+                    fair_src = 'consensus'
+
+                    if dnb_1x2_fair:
+                        fair_val = dnb_1x2_fair[dnb_side]
+                        fair_src = 'consensus (1X2→DNB)'
+                    else:
+                        # Repli : consensus direct 2-way (besoin des 2 côtés)
+                        opp = 'p1' if dnb_side == 'p0' else 'p0'
+                        if opp not in sides:
+                            continue
+                        bk_opp = _best_by_bk(sides[opp])
+                        common = set(bk_side) & set(bk_opp)
+                        if len(common) < min_books:
+                            continue
+                        probs_s = [no_vig_prob(bk_side[bk], bk_opp[bk])[0] for bk in common]
+                        avg = sum(probs_s) / len(probs_s)
+                        fair_val = 1 / avg if avg > 0 else None
+
+                    if fair_val is None:
+                        continue
+
+                    for bk, odds in bk_side.items():
+                        edge = (odds / fair_val - 1) * 100
+                        if edge >= min_edge:
+                            value_bets.append(ValueBet(
+                                match=' vs '.join(p.capitalize() for p in mk),
+                                market=_market_label(group_key),
+                                line=None,
+                                side=_side_label(dnb_side, mk),
+                                bookmaker=bk,
+                                odds=odds,
+                                fair_odds=round(fair_val, 3),
+                                edge_pct=round(edge, 1),
+                                all_odds={k: v for k, v in bk_side.items()},
+                                ref_source=fair_src,
+                            ))
+                continue  # DNB handled
 
             elif THREE_WAY:
                 # ── Marché 3-way (1X2 football) ──────────────────────────────
                 if not all(s in sides for s in ('p0', 'p1', 'draw')):
                     continue
-                bk_h  = best_by_bk(sides['p0'])
-                bk_d  = best_by_bk(sides['draw'])
-                bk_a2 = best_by_bk(sides['p1'])
+                bk_h  = _best_by_bk(sides['p0'])
+                bk_d  = _best_by_bk(sides['draw'])
+                bk_a2 = _best_by_bk(sides['p1'])
 
                 # Référence (Pinnacle)
                 ref_h = ref_d = ref_a2 = None
@@ -1015,7 +1128,7 @@ def compute_value_bets(
             else:
                 # ── Marché 2-way (tennis, basket, over/under, BTTS) ───────────
                 if group_key[0] in ('match_winner', 'handicap_spread', 'goals_handicap',
-                                    'draw_no_bet', 'q1_winner', 'ht_winner'):
+                                    'q1_winner', 'ht_winner'):
                     side_pair = ('p0', 'p1')
                 elif group_key[0] == 'btts':
                     side_pair = ('yes', 'no')
@@ -1026,8 +1139,8 @@ def compute_value_bets(
                 if s_a not in sides or s_b not in sides:
                     continue
 
-                bk_a = best_by_bk(sides[s_a])
-                bk_b = best_by_bk(sides[s_b])
+                bk_a = _best_by_bk(sides[s_a])
+                bk_b = _best_by_bk(sides[s_b])
 
                 # Référence Pinnacle
                 ref_fair_a: float | None = None
