@@ -431,6 +431,36 @@ def parse_winamax_football(data: list[dict]) -> dict:
                     result[mk][('half_time_1x2', None)][side].append(
                         Offer('winamax', o['odd'], o['label']))
 
+            # ── Handicap buts (Asian handicap) ──
+            elif norm_name == 'ecart de buts (handicap)':
+                for o in outcomes:
+                    raw_label = o['label']
+                    spread_m = re.search(r'([+-]\d+[.,]\d+|\d+[.,]\d+)\s*$', raw_label)
+                    if not spread_m:
+                        continue
+                    line = abs(float(spread_m.group(1).replace(',', '.')))
+                    team_name = raw_label[:spread_m.start()].strip()
+                    side = _football_side(team_name, _tp, mk)
+                    result[mk][('goals_handicap', line)][side].append(
+                        Offer('winamax', o['odd'], raw_label))
+
+            # ── Draw No Bet ──
+            elif (norm_name.startswith('vainqueur') and 'rembours' in norm_name
+                  and 'mi-temps' not in norm_name and len(outcomes) == 2):
+                for o in outcomes:
+                    side = _football_side(o['label'], _tp, mk)
+                    result[mk][('draw_no_bet', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
+
+            # ── MT Total buts ──
+            elif norm_name == 'mi-temps - nombre de buts':
+                for o in outcomes:
+                    line = extract_line(o['label'])
+                    over = is_over(o['label'])
+                    if line and over is not None:
+                        result[mk][('ht_total_goals', line)]['over' if over else 'under'].append(
+                            Offer('winamax', o['odd'], o['label']))
+
     return result
 
 
@@ -491,6 +521,16 @@ def parse_betclic_football(data: list[dict]) -> dict:
                     result[mk][('half_time_1x2', None)][side].append(
                         Offer('betclic', o['odds'], o['name']))
 
+            # ── MT Total buts : "Mi-temps - Nombre total de buts" ──
+            elif 'mi-temps' in norm_name and 'but' in norm_name and 'equipe' not in norm_name \
+                    and 'score' not in norm_name and 'resultat' not in norm_name:
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        result[mk][('ht_total_goals', line)]['over' if over else 'under'].append(
+                            Offer('betclic', o['odds'], o['name']))
+
     return result
 
 
@@ -548,6 +588,38 @@ def parse_unibet_football(data: list[dict]) -> dict:
                         result[mk][('double_chance', None)][side].append(
                             Offer('unibet', o['odd'], o.get('label', '')))
 
+            # ── Draw No Bet ──
+            elif (re.search(r'vainqueur|sans nul|pari sans nul', norm_name)
+                  and len(outcomes) == 2
+                  and not any(_is_draw_label(o.get('label', '')) for o in outcomes)):
+                for o in outcomes:
+                    side = _football_side(o.get('label', ''), _tp, mk)
+                    result[mk][('draw_no_bet', None)][side].append(
+                        Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── Handicap buts (Asian handicap) ──
+            elif re.search(r'handicap.*but|ecart.*but|but.*handicap', norm_name):
+                line_m = re.search(r'\[([+-]?\d+[.,]\d+)\]', name)
+                if line_m:
+                    line = abs(float(line_m.group(1).replace(',', '.')))
+                    for o in outcomes:
+                        oc_label = o.get('label', '')
+                        team_name = re.sub(r'\s*\[[^\]]*\]\s*$', '', oc_label).strip()
+                        side = _football_side(team_name, _tp, mk)
+                        result[mk][('goals_handicap', line)][side].append(
+                            Offer('unibet', o['odd'], oc_label))
+
+            # ── MT Total buts ──
+            elif re.search(r'\bbut', norm_name) and 'mi' in norm_name \
+                    and not re.search(r'equipe|buteur|score|exact', norm_name):
+                line = extract_line(name)
+                if line:
+                    for o in outcomes:
+                        over = is_over(o.get('label', ''))
+                        if over is not None:
+                            result[mk][('ht_total_goals', line)]['over' if over else 'under'].append(
+                                Offer('unibet', o['odd'], o.get('label', '')))
+
     return result
 
 
@@ -573,14 +645,46 @@ def parse_winamax_basketball(data: list[dict]) -> dict:
                     result[mk][('match_winner', None)][side].append(
                         Offer('winamax', o['odd'], o['label']))
 
-            # ── Total points ──
-            elif re.search(r'nombre de points|total points|points dans le match', norm_name):
+            # ── Total points (match entier) ──
+            elif norm_name == 'nombre de points':
                 for o in outcomes:
                     line = extract_line(o['label'])
                     over = is_over(o['label'])
                     if line and over is not None:
                         result[mk][('total_points', line)]['over' if over else 'under'].append(
                             Offer('winamax', o['odd'], o['label']))
+
+            # ── MT Total points ──
+            elif norm_name == 'mi-temps - nombre de points':
+                for o in outcomes:
+                    line = extract_line(o['label'])
+                    over = is_over(o['label'])
+                    if line and over is not None:
+                        result[mk][('ht_total_points', line)]['over' if over else 'under'].append(
+                            Offer('winamax', o['odd'], o['label']))
+
+            # ── Q1 Total points ──
+            elif norm_name == '1er quart-temps - nombre de points':
+                for o in outcomes:
+                    line = extract_line(o['label'])
+                    over = is_over(o['label'])
+                    if line and over is not None:
+                        result[mk][('q1_total_points', line)]['over' if over else 'under'].append(
+                            Offer('winamax', o['odd'], o['label']))
+
+            # ── Q1 Vainqueur (2-way, remboursé si nul) ──
+            elif norm_name.startswith('1er quart-temps - vainqueur') and len(outcomes) == 2:
+                for o in outcomes:
+                    side = _wm_player_side(o['label'], sp)
+                    result[mk][('q1_winner', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
+
+            # ── MT Vainqueur (2-way, remboursé si nul) ──
+            elif norm_name.startswith('mi-temps - vainqueur') and len(outcomes) == 2:
+                for o in outcomes:
+                    side = _wm_player_side(o['label'], sp)
+                    result[mk][('ht_winner', None)][side].append(
+                        Offer('winamax', o['odd'], o['label']))
 
             # ── Handicap spread : "Écart de points (handicap)" ──
             elif norm_name == 'ecart de points (handicap)':
@@ -615,14 +719,30 @@ def parse_betclic_basketball(data: list[dict]) -> dict:
                     result[mk][('match_winner', None)][side].append(
                         Offer('betclic', o['odds'], o['name']))
 
-            # ── Total points ──
-            elif re.search(r'total points|nombre total de points|points', norm_name):
+            # ── Total points (match entier) ──
+            elif norm_name == 'nombre total de points':
                 for o in outcomes:
                     line = extract_line(o['name'])
                     over = is_over(o['name'])
                     if line and over is not None:
                         result[mk][('total_points', line)]['over' if over else 'under'].append(
                             Offer('betclic', o['odds'], o['name']))
+
+            # ── Q1 Total points : "1er QT - Nombre total de points" ──
+            elif norm_name == '1er qt - nombre total de points':
+                for o in outcomes:
+                    line = extract_line(o['name'])
+                    over = is_over(o['name'])
+                    if line and over is not None:
+                        result[mk][('q1_total_points', line)]['over' if over else 'under'].append(
+                            Offer('betclic', o['odds'], o['name']))
+
+            # ── Q1 Vainqueur : "1er QT - Vainqueur" ──
+            elif norm_name == '1er qt - vainqueur' and len(outcomes) == 2:
+                for o in outcomes:
+                    side = _wm_player_side(o['name'], sp)
+                    result[mk][('q1_winner', None)][side].append(
+                        Offer('betclic', o['odds'], o['name']))
 
     return result
 
@@ -641,15 +761,19 @@ def parse_unibet_basketball(data: list[dict]) -> dict:
             cat       = norm(mkt.get('category', ''))
             outcomes  = mkt.get('outcomes', [])
 
-            # ── Vainqueur 2-way : "Face à Face" ou "Résultat" ──
-            if norm_name in ('face a face', 'vainqueur', 'resultat') and len(outcomes) == 2:
+            period = norm(mkt.get('period', ''))
+
+            # ── Vainqueur 2-way : "Face à Face" (match entier seulement) ──
+            if norm_name in ('face a face', 'vainqueur', 'resultat') \
+                    and len(outcomes) == 2 and period in ('', 'match'):
                 for o in outcomes:
                     side = _wm_player_side(o.get('label', ''), sp)
                     result[mk][('match_winner', None)][side].append(
                         Offer('unibet', o['odd'], o.get('label', '')))
 
-            # ── Handicap spread : "Face à Face Handicap (Points) [-9,5]" ──
-            elif re.search(r'face a face handicap|handicap.*point', norm_name):
+            # ── Handicap spread (match) : "Face à Face Handicap (Points) [-9,5]" ──
+            elif re.search(r'face a face handicap|handicap.*point', norm_name) \
+                    and period in ('', 'match'):
                 line_m = re.search(r'\[([+-]?\d+[.,]\d+)\]', name)
                 if not line_m:
                     continue
@@ -661,14 +785,36 @@ def parse_unibet_basketball(data: list[dict]) -> dict:
                     result[mk][('handicap_spread', line)][side].append(
                         Offer('unibet', o['odd'], oc_label))
 
-            # ── Total points ──
-            elif cat == 'points' or re.search(r'point', norm_name):
+            # ── Total points (match) : "Plus / Moins X.5 Point(s)" ──
+            elif re.match(r'plus / moins \d+[.,]\d+ point\(s\)$', norm_name) \
+                    and period in ('', 'match'):
                 line = extract_line(name)
                 if line:
                     for o in outcomes:
                         over = is_over(o.get('label', ''))
                         if over is not None:
                             result[mk][('total_points', line)]['over' if over else 'under'].append(
+                                Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── MT Total points : même pattern, period='mi-temps' ──
+            elif re.match(r'plus / moins \d+[.,]\d+ point\(s\)$', norm_name) \
+                    and 'mi' in period:
+                line = extract_line(name)
+                if line:
+                    for o in outcomes:
+                        over = is_over(o.get('label', ''))
+                        if over is not None:
+                            result[mk][('ht_total_points', line)]['over' if over else 'under'].append(
+                                Offer('unibet', o['odd'], o.get('label', '')))
+
+            # ── Q1 Total points : "Plus / Moins X.5 Point(s) - QT" period=1er quart ──
+            elif norm_name.endswith('- qt') and '1er' in period:
+                line = extract_line(name)
+                if line:
+                    for o in outcomes:
+                        over = is_over(o.get('label', ''))
+                        if over is not None:
+                            result[mk][('q1_total_points', line)]['over' if over else 'under'].append(
                                 Offer('unibet', o['odd'], o.get('label', '')))
 
     return result
@@ -717,6 +863,13 @@ def _market_label(key) -> str:
         'double_chance':     'Double chance',
         'half_time_1x2':     'MT 1X2',
         'handicap_spread':   'Handicap',
+        'goals_handicap':    'Handicap buts',
+        'draw_no_bet':       'Vainqueur (sans nul)',
+        'ht_total_goals':    'MT Total buts',
+        'ht_total_points':   'MT Total points',
+        'q1_total_points':   'Q1 Total points',
+        'q1_winner':         'Q1 Vainqueur',
+        'ht_winner':         'MT Vainqueur',
     }
     base = labels.get(market, market)
     if len(key) == 3 and key[2] not in ('over', 'under', 'p0', 'p1', 'home', 'away', 'draw'):
@@ -861,7 +1014,8 @@ def compute_value_bets(
 
             else:
                 # ── Marché 2-way (tennis, basket, over/under, BTTS) ───────────
-                if group_key[0] in ('match_winner', 'handicap_spread'):
+                if group_key[0] in ('match_winner', 'handicap_spread', 'goals_handicap',
+                                    'draw_no_bet', 'q1_winner', 'ht_winner'):
                     side_pair = ('p0', 'p1')
                 elif group_key[0] == 'btts':
                     side_pair = ('yes', 'no')
@@ -991,7 +1145,8 @@ def detect_surebets(
             # Determine side pairs
             if market_type in ('match_winner_1x2', 'half_time_1x2'):
                 side_keys = ('p0', 'draw', 'p1')
-            elif market_type in ('match_winner', 'handicap_spread'):
+            elif market_type in ('match_winner', 'handicap_spread', 'goals_handicap',
+                                  'draw_no_bet', 'q1_winner', 'ht_winner'):
                 side_keys = ('p0', 'p1')
             elif market_type == 'btts':
                 side_keys = ('yes', 'no')
