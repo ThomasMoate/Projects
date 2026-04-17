@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+output/
+*.png
+*.pdf
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.env
